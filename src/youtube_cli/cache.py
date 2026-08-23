@@ -10,6 +10,13 @@ PLAYLISTS_COLLECTION = "playlists"
 
 
 @dataclass(frozen=True)
+class CollectionStatus:
+    name: str
+    fetched_at: str
+    count: int
+
+
+@dataclass(frozen=True)
 class CachedPlaylists:
     playlists: tuple[Playlist, ...]
     fetched_at: str
@@ -34,6 +41,40 @@ class LibraryCache:
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+
+    def clear(self) -> None:
+        self.close()
+        if self.db_path.exists():
+            self.db_path.unlink()
+
+    def status(self) -> tuple[CollectionStatus, ...]:
+        if not self.db_path.exists():
+            return ()
+        opened_here = self._conn is None
+        if opened_here:
+            self.open()
+        try:
+            conn = self._require_conn()
+            rows = conn.execute(
+                "SELECT name, fetched_at FROM collection_meta ORDER BY name"
+            ).fetchall()
+            collections: list[CollectionStatus] = []
+            for row in rows:
+                name = row["name"]
+                if name != PLAYLISTS_COLLECTION:
+                    continue
+                count_row = conn.execute("SELECT COUNT(*) AS n FROM playlists").fetchone()
+                collections.append(
+                    CollectionStatus(
+                        name=name,
+                        fetched_at=row["fetched_at"],
+                        count=int(count_row["n"]) if count_row is not None else 0,
+                    )
+                )
+            return tuple(collections)
+        finally:
+            if opened_here:
+                self.close()
 
     def load_playlists(self) -> CachedPlaylists | None:
         conn = self._require_conn()

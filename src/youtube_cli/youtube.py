@@ -6,7 +6,14 @@ from typing import Protocol, cast
 import httpx
 
 YOUTUBE_PLAYLISTS_URL = "https://www.googleapis.com/youtube/v3/playlists"
+YOUTUBE_CHANNELS_URL = "https://www.googleapis.com/youtube/v3/channels"
 PAGE_SIZE = 50
+
+
+@dataclass(frozen=True)
+class Channel:
+    id: str
+    title: str
 
 
 @dataclass(frozen=True)
@@ -32,6 +39,8 @@ class PlaylistListResult:
 class YouTubeClient(Protocol):
     def list_playlists(self, *, limit: int) -> PlaylistListResult: ...
 
+    def get_mine_channel(self) -> Channel: ...
+
 
 class QuotaExceededError(Exception):
     pass
@@ -45,17 +54,34 @@ class YouTubeApiError(Exception):
     pass
 
 
+class UnauthorizedError(YouTubeApiError):
+    pass
+
+
 class InMemoryYouTubeClient:
     def __init__(
         self,
         playlists: tuple[Playlist, ...] = (),
         *,
+        channel: Channel | None = None,
         quota_exceeded: bool = False,
         network_error: bool = False,
+        unauthorized: bool = False,
     ) -> None:
         self.playlists = playlists
+        self.channel = channel or Channel(id="UCmine", title="Fixture Channel")
         self.quota_exceeded = quota_exceeded
         self.network_error = network_error
+        self.unauthorized = unauthorized
+
+    def get_mine_channel(self) -> Channel:
+        if self.network_error:
+            raise NetworkError("network failure")
+        if self.quota_exceeded:
+            raise QuotaExceededError("quota exceeded")
+        if self.unauthorized:
+            raise UnauthorizedError("access token rejected")
+        return self.channel
 
     def list_playlists(self, *, limit: int) -> PlaylistListResult:
         if self.network_error:
@@ -79,6 +105,27 @@ class LiveYouTubeClient:
     ) -> None:
         self._access_token = access_token
         self._http = http or httpx.Client(timeout=30.0)
+
+    def get_mine_channel(self) -> Channel:
+        try:
+            response = self._http.get(
+                YOUTUBE_CHANNELS_URL,
+                params={"part": "snippet", "mine": "true"},
+                headers={"Authorization": f"Bearer {self._access_token}"},
+            )
+        except httpx.RequestError as exc:
+            raise NetworkError("network failure") from exc
+        _raise_for_youtube(response)
+        payload = _object_map(response.json())
+        items = _object_list(payload.get("items"))
+        if not items:
+            raise YouTubeApiError("YouTube API returned no channel")
+        item = _object_map(items[0])
+        snippet = _object_map(item.get("snippet"))
+        channel_id = item.get("id")
+        if not isinstance(channel_id, str):
+            raise YouTubeApiError("YouTube API returned no channel")
+        return Channel(id=channel_id, title=_as_str(snippet.get("title")))
 
     def list_playlists(self, *, limit: int) -> PlaylistListResult:
         playlists: list[Playlist] = []
@@ -160,6 +207,8 @@ def _playlists_from_items(items: object) -> list[Playlist]:
 
 
 def _raise_for_youtube(response: httpx.Response) -> None:
+    if response.status_code == 401:
+        raise UnauthorizedError("access token rejected")
     if response.status_code == 403 and _is_quota_error(response):
         raise QuotaExceededError("YouTube API quota exceeded")
     try:

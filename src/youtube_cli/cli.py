@@ -4,18 +4,29 @@ import argparse
 import json
 import os
 import sys
+import webbrowser
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO
 
-from youtube_cli.cache import LibraryCache
+from youtube_cli.cache import CollectionStatus, LibraryCache
 from youtube_cli.credentials import CredentialStore, KeychainCredentialStore, Tokens
+from youtube_cli.oauth import (
+    ClientSecretError,
+    LoginError,
+    exchange_google_code,
+    load_client_credentials,
+    login_via_loopback,
+    refresh_google_tokens,
+)
 from youtube_cli.youtube import (
     LiveYouTubeClient,
     NetworkError,
     Playlist,
     QuotaExceededError,
+    UnauthorizedError,
     YouTubeApiError,
     YouTubeClient,
 )
@@ -47,11 +58,46 @@ class CacheEmptyError(CliError):
 
 
 @dataclass(frozen=True)
+class AuthLoginRequest:
+    pass
+
+
+@dataclass(frozen=True)
+class AuthLogoutRequest:
+    wipe: bool
+
+
+@dataclass(frozen=True)
+class AuthStatusRequest:
+    table: bool
+
+
+@dataclass(frozen=True)
+class CacheClearRequest:
+    pass
+
+
+@dataclass(frozen=True)
+class CacheStatusRequest:
+    table: bool
+
+
+@dataclass(frozen=True)
 class PlaylistsListRequest:
     table: bool
     fresh: bool
     offline: bool
     limit: int
+
+
+Request = (
+    AuthLoginRequest
+    | AuthLogoutRequest
+    | AuthStatusRequest
+    | CacheClearRequest
+    | CacheStatusRequest
+    | PlaylistsListRequest
+)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -69,12 +115,48 @@ def run(
     credentials: CredentialStore | None = None,
     youtube: YouTubeClient | None = None,
     cache_dir: Path | None = None,
+    config_dir: Path | None = None,
     stdout: TextIO | None = None,
+    open_browser: Callable[[str], object] | None = None,
+    exchange_code: Callable[..., Tokens] | None = None,
+    refresh_tokens: Callable[[Tokens], Tokens] | None = None,
 ) -> int:
     out = stdout or sys.stdout
     try:
         request = _parse(argv)
-        tokens = _require_tokens(credentials)
+        if isinstance(request, AuthLoginRequest):
+            return _auth_login(
+                credentials=credentials,
+                config_dir=config_dir,
+                stdout=out,
+                open_browser=open_browser,
+                exchange_code=exchange_code,
+            )
+        if isinstance(request, AuthLogoutRequest):
+            return _auth_logout(
+                request,
+                credentials=credentials,
+                cache_dir=cache_dir,
+                stdout=out,
+            )
+        if isinstance(request, AuthStatusRequest):
+            return _auth_status(
+                request,
+                credentials=credentials,
+                youtube=youtube,
+                config_dir=config_dir,
+                refresh_tokens=refresh_tokens,
+                stdout=out,
+            )
+        if isinstance(request, CacheStatusRequest):
+            return _cache_status(request, cache_dir=cache_dir, stdout=out)
+        if isinstance(request, CacheClearRequest):
+            return _cache_clear(cache_dir=cache_dir, stdout=out)
+        tokens = _require_tokens(
+            credentials,
+            config_dir=config_dir,
+            refresh_tokens=refresh_tokens,
+        )
         client = youtube if youtube is not None else LiveYouTubeClient(tokens.access_token)
         return _playlists_list(
             request,
@@ -103,9 +185,12 @@ def run(
     except YouTubeApiError as exc:
         _write_error(out, code="error", message=str(exc))
         return 1
+    except (ClientSecretError, LoginError, CliError) as exc:
+        _write_error(out, code="error", message=exc.message)
+        return 1
 
 
-def _parse(argv: list[str]) -> PlaylistsListRequest:
+def _parse(argv: list[str]) -> Request:
     if not argv:
         raise UsageError("missing command")
 
@@ -117,6 +202,18 @@ def _parse(argv: list[str]) -> PlaylistsListRequest:
     except SystemExit as exc:
         raise UsageError("invalid arguments") from exc
 
+    if args.wipe and not (args.noun == "auth" and args.verb == "logout"):
+        raise UsageError("--wipe is only valid with auth logout")
+    if args.noun == "auth" and args.verb == "status":
+        return AuthStatusRequest(table=args.table)
+    if args.noun == "auth" and args.verb == "logout":
+        return AuthLogoutRequest(wipe=args.wipe)
+    if args.noun == "auth" and args.verb == "login":
+        return AuthLoginRequest()
+    if args.noun == "cache" and args.verb == "status":
+        return CacheStatusRequest(table=args.table)
+    if args.noun == "cache" and args.verb == "clear":
+        return CacheClearRequest()
     if args.noun != "playlists" or args.verb != "list":
         raise UsageError(f"unknown command: {' '.join(argv)}")
     if args.offline and args.fresh:
@@ -139,6 +236,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--table", action="store_true")
     parser.add_argument("--fresh", action="store_true")
     parser.add_argument("--offline", action="store_true")
+    parser.add_argument("--wipe", action="store_true")
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
 
     def error(message: str) -> None:
@@ -148,15 +246,51 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _require_tokens(credentials: CredentialStore | None) -> Tokens:
+def _require_tokens(
+    credentials: CredentialStore | None,
+    *,
+    config_dir: Path | None,
+    refresh_tokens: Callable[[Tokens], Tokens] | None,
+) -> Tokens:
     if credentials is None:
         raise AuthRequiredError("not logged in; run youtube auth login")
     tokens = credentials.load()
     if tokens is None:
         raise AuthRequiredError("not logged in; run youtube auth login")
-    if tokens.expires_at is not None and tokens.expires_at <= datetime.now(UTC):
+    tokens = _refresh_if_needed(
+        tokens,
+        credentials=credentials,
+        config_dir=config_dir,
+        refresh_tokens=refresh_tokens,
+    )
+    if _expired(tokens):
         raise AuthExpiredError("access token expired; run youtube auth login")
     return tokens
+
+
+def _expired(tokens: Tokens) -> bool:
+    return tokens.expires_at is not None and tokens.expires_at <= datetime.now(UTC)
+
+
+def _refresh_if_needed(
+    tokens: Tokens,
+    *,
+    credentials: CredentialStore,
+    config_dir: Path | None,
+    refresh_tokens: Callable[[Tokens], Tokens] | None,
+) -> Tokens:
+    if not _expired(tokens) or not tokens.refresh_token:
+        return tokens
+    try:
+        if refresh_tokens is not None:
+            refreshed = refresh_tokens(tokens)
+        else:
+            client = load_client_credentials(config_dir=_resolve_config_dir(config_dir))
+            refreshed = refresh_google_tokens(tokens, client)
+    except (ClientSecretError, LoginError):
+        return tokens
+    credentials.save(refreshed)
+    return refreshed
 
 
 def _open_cache(cache_dir: Path | None) -> LibraryCache:
@@ -172,6 +306,210 @@ def _resolve_cache_dir(cache_dir: Path | None) -> Path:
     if env:
         return Path(env)
     return Path.home() / ".cache" / "youtube-cli"
+
+
+def _auth_login(
+    *,
+    credentials: CredentialStore | None,
+    config_dir: Path | None,
+    stdout: TextIO,
+    open_browser: Callable[[str], object] | None,
+    exchange_code: Callable[..., Tokens] | None,
+) -> int:
+    if credentials is None:
+        raise CliError("credential store is required for login")
+    client = load_client_credentials(config_dir=_resolve_config_dir(config_dir))
+    exchanger = exchange_code if exchange_code is not None else exchange_google_code
+    tokens = login_via_loopback(
+        client,
+        open_browser=open_browser or webbrowser.open,
+        exchange_code=exchanger,
+    )
+    credentials.save(tokens)
+    json.dump(
+        {
+            "ok": True,
+            "data": {"logged_in": True},
+            "meta": {
+                "from_cache": False,
+                "fetched_at": _now_iso(),
+                "truncated": False,
+                "limit": DEFAULT_LIMIT,
+            },
+        },
+        stdout,
+    )
+    stdout.write("\n")
+    return 0
+
+
+def _resolve_config_dir(config_dir: Path | None) -> Path:
+    if config_dir is not None:
+        return config_dir
+    return Path.home() / ".config" / "youtube-cli"
+
+
+def _auth_logout(
+    request: AuthLogoutRequest,
+    *,
+    credentials: CredentialStore | None,
+    cache_dir: Path | None,
+    stdout: TextIO,
+) -> int:
+    if credentials is not None:
+        credentials.delete()
+    if request.wipe:
+        LibraryCache(_resolve_cache_dir(cache_dir)).clear()
+    json.dump(
+        {
+            "ok": True,
+            "data": {"logged_out": True, "wiped": request.wipe},
+            "meta": {
+                "from_cache": False,
+                "fetched_at": _now_iso(),
+                "truncated": False,
+                "limit": DEFAULT_LIMIT,
+            },
+        },
+        stdout,
+    )
+    stdout.write("\n")
+    return 0
+
+
+def _auth_status(
+    request: AuthStatusRequest,
+    *,
+    credentials: CredentialStore | None,
+    youtube: YouTubeClient | None,
+    config_dir: Path | None,
+    refresh_tokens: Callable[[Tokens], Tokens] | None,
+    stdout: TextIO,
+) -> int:
+    tokens = credentials.load() if credentials is not None else None
+    if tokens is not None and credentials is not None:
+        tokens = _refresh_if_needed(
+            tokens,
+            credentials=credentials,
+            config_dir=config_dir,
+            refresh_tokens=refresh_tokens,
+        )
+    token_ok = tokens is not None and not _expired(tokens)
+    channel_title: str | None = None
+    quota_cost: int | None = None
+    if token_ok:
+        assert tokens is not None
+        client = youtube if youtube is not None else LiveYouTubeClient(tokens.access_token)
+        try:
+            channel_title = client.get_mine_channel().title
+            quota_cost = 1
+        except UnauthorizedError:
+            token_ok = False
+            quota_cost = 1
+    data: dict[str, object] = {
+        "channel_title": channel_title,
+        "token_ok": token_ok,
+        "expires_at": _iso(tokens.expires_at) if tokens is not None and tokens.expires_at else None,
+    }
+    meta: dict[str, object] = {
+        "from_cache": False,
+        "fetched_at": _now_iso(),
+        "truncated": False,
+        "limit": DEFAULT_LIMIT,
+    }
+    if quota_cost is not None:
+        meta["quota_cost"] = quota_cost
+    if request.table:
+        _write_auth_status_table(stdout, data)
+        return 0
+    json.dump({"ok": True, "data": data, "meta": meta}, stdout)
+    stdout.write("\n")
+    return 0
+
+
+def _cache_status(
+    request: CacheStatusRequest,
+    *,
+    cache_dir: Path | None,
+    stdout: TextIO,
+) -> int:
+    cache = LibraryCache(_resolve_cache_dir(cache_dir))
+    collections = cache.status()
+    data = {
+        "path": str(cache.db_path),
+        "collections": {
+            item.name: {"fetched_at": item.fetched_at, "count": item.count}
+            for item in collections
+        },
+    }
+    if request.table:
+        _write_cache_status_table(stdout, cache.db_path, collections)
+        return 0
+    json.dump(
+        {
+            "ok": True,
+            "data": data,
+            "meta": {
+                "from_cache": True,
+                "fetched_at": collections[0].fetched_at if collections else _now_iso(),
+                "truncated": False,
+                "limit": DEFAULT_LIMIT,
+            },
+        },
+        stdout,
+    )
+    stdout.write("\n")
+    return 0
+
+
+def _cache_clear(*, cache_dir: Path | None, stdout: TextIO) -> int:
+    cache = LibraryCache(_resolve_cache_dir(cache_dir))
+    cache.clear()
+    json.dump(
+        {
+            "ok": True,
+            "data": {"cleared": True},
+            "meta": {
+                "from_cache": True,
+                "fetched_at": _now_iso(),
+                "truncated": False,
+                "limit": DEFAULT_LIMIT,
+            },
+        },
+        stdout,
+    )
+    stdout.write("\n")
+    return 0
+
+
+def _write_cache_status_table(
+    out: TextIO, path: Path, collections: tuple[CollectionStatus, ...]
+) -> None:
+    out.write(f"path\t{path}\n")
+    out.write("collection\tfetched_at\tcount\n")
+    for item in collections:
+        out.write(f"{item.name}\t{item.fetched_at}\t{item.count}\n")
+
+
+def _iso(value: datetime) -> str:
+    return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _write_auth_status_table(out: TextIO, data: dict[str, object]) -> None:
+    out.write("channel_title\ttoken_ok\texpires_at\n")
+    out.write(
+        f"{_table_cell(data['channel_title'])}\t"
+        f"{_table_cell(data['token_ok'])}\t"
+        f"{_table_cell(data['expires_at'])}\n"
+    )
+
+
+def _table_cell(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
 
 
 def _playlists_list(
