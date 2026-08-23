@@ -1,0 +1,33 @@
+[project]
+name = "youtube-cli"
+version = "0.1.0"
+description = "Personal local-first YouTube CLI"
+authors = [
+    { name = "dikology", email = "dgimaletdinov@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.28",
+    "keyring>=25.0",
+]
+
+[project.scripts]
+youtube = "youtube_cli.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.9.18,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1",
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.pyright]
+include = ["src"]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
