@@ -12,9 +12,18 @@ import pytest
 
 from youtube_cli.cli import run
 from youtube_cli.credentials import CredentialStore, InMemoryCredentialStore, Tokens
+from youtube_cli.oauth import LoginError
 from youtube_cli.youtube import InMemoryYouTubeClient, Playlist, YouTubeClient
 
 _MISSING = object()
+
+
+def _reject_browser(url: str) -> None:
+    raise AssertionError(f"browser must not open for this command: {url}")
+
+
+def _reject_refresh(tokens: Tokens) -> Tokens:
+    raise LoginError("tests must inject refresh_tokens; refusing to call Google")
 
 
 @dataclass(frozen=True)
@@ -32,6 +41,11 @@ Invoke = Callable[..., CliResult]
 @pytest.fixture
 def cache_dir(tmp_path: Path) -> Path:
     return tmp_path / "cache"
+
+
+@pytest.fixture
+def config_dir(tmp_path: Path) -> Path:
+    return tmp_path / "config"
 
 
 @pytest.fixture
@@ -63,24 +77,38 @@ def youtube() -> InMemoryYouTubeClient:
 
 
 @pytest.fixture
-def invoke(cache_dir: Path) -> Invoke:
+def invoke(cache_dir: Path, config_dir: Path) -> Invoke:
     def _invoke(
         argv: list[str],
         *,
         credentials: CredentialStore | None = None,
         youtube: YouTubeClient | None = None,
         cache_dir_override: Path | None | object = _MISSING,
+        config_dir_override: Path | None | object = _MISSING,
+        open_browser: Callable[[str], object] | None = None,
+        exchange_code: Callable[..., Tokens] | None = None,
+        refresh_tokens: Callable[[Tokens], Tokens] | None = None,
     ) -> CliResult:
         stdout = StringIO()
         resolved_cache_dir = (
             cache_dir if cache_dir_override is _MISSING else cache_dir_override
+        )
+        resolved_config_dir = (
+            config_dir if config_dir_override is _MISSING else config_dir_override
         )
         exit_code = run(
             argv,
             credentials=credentials,
             youtube=youtube,
             cache_dir=resolved_cache_dir,  # type: ignore[arg-type]
+            config_dir=resolved_config_dir,  # type: ignore[arg-type]
             stdout=stdout,
+            open_browser=open_browser
+            or (_reject_browser),
+            exchange_code=exchange_code,
+            refresh_tokens=refresh_tokens
+            if refresh_tokens is not None
+            else _reject_refresh,
         )
         return CliResult(exit_code=exit_code, stdout=stdout.getvalue())
 
