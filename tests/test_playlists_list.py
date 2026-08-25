@@ -97,11 +97,20 @@ def test_lazy_fill_writes_playlists_only(invoke, credentials, youtube, cache_dir
             "SELECT name FROM sqlite_master WHERE type = 'table'"
         ).fetchall()
     }
+    item_rows = (
+        conn.execute("SELECT COUNT(*) FROM playlist_items").fetchone()[0]
+        if "playlist_items" in tables
+        else 0
+    )
+    item_meta = conn.execute(
+        "SELECT name FROM collection_meta WHERE name LIKE 'playlist_items:%'"
+    ).fetchall()
     conn.close()
     assert "playlists" in tables
     assert "likes" not in tables
     assert "subscriptions" not in tables
-    assert "playlist_items" not in tables
+    assert item_rows == 0
+    assert item_meta == []
 
 
 def test_fresh_snapshot_replaces_cached_playlists(

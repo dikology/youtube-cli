@@ -24,7 +24,9 @@ from youtube_cli.oauth import (
 from youtube_cli.youtube import (
     LiveYouTubeClient,
     NetworkError,
+    NotFoundError,
     Playlist,
+    PlaylistItem,
     QuotaExceededError,
     UnauthorizedError,
     YouTubeApiError,
@@ -54,6 +56,10 @@ class AuthExpiredError(CliError):
 
 
 class CacheEmptyError(CliError):
+    pass
+
+
+class OfflineMissError(CliError):
     pass
 
 
@@ -90,6 +96,24 @@ class PlaylistsListRequest:
     limit: int
 
 
+@dataclass(frozen=True)
+class PlaylistShowRequest:
+    playlist_id: str
+    table: bool
+    fresh: bool
+    offline: bool
+    limit: int
+
+
+@dataclass(frozen=True)
+class PlaylistItemsRequest:
+    playlist_id: str
+    table: bool
+    fresh: bool
+    offline: bool
+    limit: int
+
+
 Request = (
     AuthLoginRequest
     | AuthLogoutRequest
@@ -97,6 +121,8 @@ Request = (
     | CacheClearRequest
     | CacheStatusRequest
     | PlaylistsListRequest
+    | PlaylistShowRequest
+    | PlaylistItemsRequest
 )
 
 
@@ -158,10 +184,15 @@ def run(
             refresh_tokens=refresh_tokens,
         )
         client = youtube if youtube is not None else LiveYouTubeClient(tokens.access_token)
+        cache = _open_cache(cache_dir)
+        if isinstance(request, PlaylistShowRequest):
+            return _playlist_show(request, youtube=client, cache=cache, stdout=out)
+        if isinstance(request, PlaylistItemsRequest):
+            return _playlist_items(request, youtube=client, cache=cache, stdout=out)
         return _playlists_list(
             request,
             youtube=client,
-            cache=_open_cache(cache_dir),
+            cache=cache,
             stdout=out,
         )
     except UsageError as exc:
@@ -176,6 +207,12 @@ def run(
     except CacheEmptyError as exc:
         _write_error(out, code="cache_empty", message=exc.message)
         return 1
+    except OfflineMissError as exc:
+        _write_error(out, code="offline_miss", message=exc.message)
+        return 1
+    except NotFoundError as exc:
+        _write_error(out, code="not_found", message=str(exc) or "not found")
+        return 5
     except QuotaExceededError as exc:
         _write_error(out, code="quota_exceeded", message=str(exc) or "YouTube API quota exceeded")
         return 4
@@ -214,25 +251,47 @@ def _parse(argv: list[str]) -> Request:
         return CacheStatusRequest(table=args.table)
     if args.noun == "cache" and args.verb == "clear":
         return CacheClearRequest()
-    if args.noun != "playlists" or args.verb != "list":
-        raise UsageError(f"unknown command: {' '.join(argv)}")
     if args.offline and args.fresh:
         raise UsageError("--offline and --fresh cannot be combined")
     if args.limit > MAX_LIMIT or args.limit < 1:
         raise UsageError(f"--limit must be between 1 and {MAX_LIMIT}")
-
-    return PlaylistsListRequest(
-        table=args.table,
-        fresh=args.fresh,
-        offline=args.offline,
-        limit=args.limit,
-    )
+    if args.noun == "playlists" and args.verb == "list":
+        if args.target:
+            raise UsageError("playlists list does not take an id")
+        return PlaylistsListRequest(
+            table=args.table,
+            fresh=args.fresh,
+            offline=args.offline,
+            limit=args.limit,
+        )
+    if args.noun == "playlist" and args.verb == "show":
+        if not args.target:
+            raise UsageError("playlist show requires a playlist id")
+        return PlaylistShowRequest(
+            playlist_id=args.target,
+            table=args.table,
+            fresh=args.fresh,
+            offline=args.offline,
+            limit=args.limit,
+        )
+    if args.noun == "playlist" and args.verb == "items":
+        if not args.target:
+            raise UsageError("playlist items requires a playlist id")
+        return PlaylistItemsRequest(
+            playlist_id=args.target,
+            table=args.table,
+            fresh=args.fresh,
+            offline=args.offline,
+            limit=args.limit,
+        )
+    raise UsageError(f"unknown command: {' '.join(argv)}")
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="youtube", add_help=False)
     parser.add_argument("noun")
     parser.add_argument("verb", nargs="?")
+    parser.add_argument("target", nargs="?")
     parser.add_argument("--table", action="store_true")
     parser.add_argument("--fresh", action="store_true")
     parser.add_argument("--offline", action="store_true")
@@ -512,6 +571,102 @@ def _table_cell(value: object) -> str:
     return str(value)
 
 
+def _playlist_show(
+    request: PlaylistShowRequest,
+    *,
+    youtube: YouTubeClient,
+    cache: LibraryCache,
+    stdout: TextIO,
+) -> int:
+    if not request.fresh:
+        cached = cache.load_playlist(request.playlist_id)
+        if cached is not None:
+            _emit_playlist(
+                stdout,
+                playlist=cached.playlist,
+                table=request.table,
+                meta={
+                    "from_cache": True,
+                    "fetched_at": cached.fetched_at,
+                    "truncated": False,
+                    "limit": request.limit,
+                },
+            )
+            return 0
+        if request.offline:
+            raise OfflineMissError("playlist is not in the cache; run without --offline")
+
+    fetched_at = _now_iso()
+    result = youtube.get_playlist(request.playlist_id)
+    cache.upsert_playlist(result.playlist, fetched_at=fetched_at)
+    _emit_playlist(
+        stdout,
+        playlist=result.playlist,
+        table=request.table,
+        meta={
+            "from_cache": False,
+            "fetched_at": fetched_at,
+            "truncated": False,
+            "limit": request.limit,
+            "quota_cost": result.quota_cost,
+        },
+    )
+    return 0
+
+
+def _playlist_items(
+    request: PlaylistItemsRequest,
+    *,
+    youtube: YouTubeClient,
+    cache: LibraryCache,
+    stdout: TextIO,
+) -> int:
+    if not request.fresh:
+        cached = cache.load_playlist_items(request.playlist_id)
+        if cached is not None:
+            items = cached.items[: request.limit]
+            _emit_playlist_items(
+                stdout,
+                items=items,
+                table=request.table,
+                meta={
+                    "from_cache": True,
+                    "fetched_at": cached.fetched_at,
+                    "truncated": cached.truncated or len(cached.items) > request.limit,
+                    "limit": request.limit,
+                },
+            )
+            return 0
+        if request.offline:
+            raise OfflineMissError(
+                "playlist items are not in the cache; run without --offline"
+            )
+
+    fetched_at = _now_iso()
+    result = youtube.list_playlist_items(
+        request.playlist_id, limit=request.limit
+    )
+    cache.replace_playlist_items(
+        request.playlist_id,
+        result.items,
+        fetched_at=fetched_at,
+        truncated=result.truncated,
+    )
+    _emit_playlist_items(
+        stdout,
+        items=result.items,
+        table=request.table,
+        meta={
+            "from_cache": False,
+            "fetched_at": fetched_at,
+            "truncated": result.truncated,
+            "limit": request.limit,
+            "quota_cost": result.quota_cost,
+        },
+    )
+    return 0
+
+
 def _playlists_list(
     request: PlaylistsListRequest,
     *,
@@ -573,6 +728,69 @@ def _playlist_payload(playlist: Playlist) -> dict[str, str | int]:
 
 def _now_iso() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _emit_playlist(
+    out: TextIO,
+    *,
+    playlist: Playlist,
+    table: bool,
+    meta: dict[str, object],
+) -> None:
+    if table:
+        _write_table(out, (playlist,))
+        return
+    json.dump(
+        {
+            "ok": True,
+            "data": _playlist_payload(playlist),
+            "meta": meta,
+        },
+        out,
+    )
+    out.write("\n")
+
+
+def _playlist_item_payload(item: PlaylistItem) -> dict[str, str | int | bool]:
+    return {
+        "playlist_id": item.playlist_id,
+        "position": item.position,
+        "video_id": item.video_id,
+        "title": item.title,
+        "channel_title": item.channel_title,
+        "available": item.available,
+        "url": item.url,
+    }
+
+
+def _emit_playlist_items(
+    out: TextIO,
+    *,
+    items: tuple[PlaylistItem, ...],
+    table: bool,
+    meta: dict[str, object],
+) -> None:
+    if table:
+        _write_items_table(out, items)
+        return
+    json.dump(
+        {
+            "ok": True,
+            "data": {"items": [_playlist_item_payload(item) for item in items]},
+            "meta": meta,
+        },
+        out,
+    )
+    out.write("\n")
+
+
+def _write_items_table(out: TextIO, items: tuple[PlaylistItem, ...]) -> None:
+    out.write("video_id\ttitle\tchannel_title\tavailable\n")
+    for item in items:
+        out.write(
+            f"{item.video_id}\t{item.title}\t{item.channel_title}\t"
+            f"{_table_cell(item.available)}\n"
+        )
 
 
 def _emit_playlists(

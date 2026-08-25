@@ -13,7 +13,7 @@ import pytest
 from youtube_cli.cli import run
 from youtube_cli.credentials import CredentialStore, InMemoryCredentialStore, Tokens
 from youtube_cli.oauth import LoginError
-from youtube_cli.youtube import InMemoryYouTubeClient, Playlist, YouTubeClient
+from youtube_cli.youtube import InMemoryYouTubeClient, Playlist, PlaylistItem, YouTubeClient
 
 _MISSING = object()
 
@@ -72,7 +72,35 @@ def youtube() -> InMemoryYouTubeClient:
                 privacy="private",
                 channel_id="UCmine",
             ),
-        )
+        ),
+        items={
+            "PLowned1": (
+                PlaylistItem(
+                    playlist_id="PLowned1",
+                    position=0,
+                    video_id="vidAvailable1",
+                    title="First video",
+                    channel_title="Fixture Channel",
+                    available=True,
+                ),
+                PlaylistItem(
+                    playlist_id="PLowned1",
+                    position=1,
+                    video_id="vidDeleted1",
+                    title="Deleted video",
+                    channel_title="",
+                    available=False,
+                ),
+                PlaylistItem(
+                    playlist_id="PLowned1",
+                    position=2,
+                    video_id="vidAvailable2",
+                    title="Third video",
+                    channel_title="Other Channel",
+                    available=True,
+                ),
+            )
+        },
     )
 
 
