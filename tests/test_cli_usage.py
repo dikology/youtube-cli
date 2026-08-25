@@ -34,6 +34,18 @@ def test_playlists_without_list_returns_usage(invoke) -> None:
     _assert_usage(result)
 
 
+def test_likes_without_list_returns_usage(invoke) -> None:
+    result = invoke(["likes"])
+
+    _assert_usage(result)
+
+
+def test_subs_without_list_returns_usage(invoke) -> None:
+    result = invoke(["subs"])
+
+    _assert_usage(result)
+
+
 def test_unknown_flag_returns_usage(invoke) -> None:
     result = invoke(["playlists", "list", "--json"])
 

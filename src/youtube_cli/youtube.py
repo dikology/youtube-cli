@@ -8,8 +8,10 @@ import httpx
 YOUTUBE_PLAYLISTS_URL = "https://www.googleapis.com/youtube/v3/playlists"
 YOUTUBE_PLAYLIST_ITEMS_URL = "https://www.googleapis.com/youtube/v3/playlistItems"
 YOUTUBE_CHANNELS_URL = "https://www.googleapis.com/youtube/v3/channels"
+YOUTUBE_SUBSCRIPTIONS_URL = "https://www.googleapis.com/youtube/v3/subscriptions"
 PAGE_SIZE = 50
 UNAVAILABLE_TITLES = frozenset({"Deleted video", "Private video"})
+LIKED_VIDEOS_PLAYLIST_ID = "LL"
 
 
 @dataclass(frozen=True)
@@ -46,6 +48,30 @@ class PlaylistItem:
 
 
 @dataclass(frozen=True)
+class LikedVideo:
+    video_id: str
+    title: str
+    channel_title: str
+    available: bool
+    position: int | None = None
+
+    @property
+    def url(self) -> str:
+        return f"https://www.youtube.com/watch?v={self.video_id}"
+
+
+@dataclass(frozen=True)
+class Subscription:
+    channel_id: str
+    title: str
+    subscribed_at: str
+
+    @property
+    def url(self) -> str:
+        return f"https://www.youtube.com/channel/{self.channel_id}"
+
+
+@dataclass(frozen=True)
 class PlaylistListResult:
     playlists: tuple[Playlist, ...]
     quota_cost: int
@@ -65,6 +91,20 @@ class PlaylistItemListResult:
     truncated: bool
 
 
+@dataclass(frozen=True)
+class LikeListResult:
+    likes: tuple[LikedVideo, ...]
+    quota_cost: int
+    truncated: bool
+
+
+@dataclass(frozen=True)
+class SubscriptionListResult:
+    subscriptions: tuple[Subscription, ...]
+    quota_cost: int
+    truncated: bool
+
+
 class YouTubeClient(Protocol):
     def list_playlists(self, *, limit: int) -> PlaylistListResult: ...
 
@@ -73,6 +113,10 @@ class YouTubeClient(Protocol):
     def list_playlist_items(
         self, playlist_id: str, *, limit: int
     ) -> PlaylistItemListResult: ...
+
+    def list_likes(self, *, limit: int) -> LikeListResult: ...
+
+    def list_subscriptions(self, *, limit: int) -> SubscriptionListResult: ...
 
     def get_mine_channel(self) -> Channel: ...
 
@@ -103,6 +147,8 @@ class InMemoryYouTubeClient:
         playlists: tuple[Playlist, ...] = (),
         *,
         items: dict[str, tuple[PlaylistItem, ...]] | None = None,
+        likes: tuple[LikedVideo, ...] = (),
+        subscriptions: tuple[Subscription, ...] = (),
         channel: Channel | None = None,
         quota_exceeded: bool = False,
         network_error: bool = False,
@@ -110,6 +156,8 @@ class InMemoryYouTubeClient:
     ) -> None:
         self.playlists = playlists
         self.items_by_playlist = items or {}
+        self.likes = likes
+        self.subscriptions = subscriptions
         self.channel = channel or Channel(id="UCmine", title="Fixture Channel")
         self.quota_exceeded = quota_exceeded
         self.network_error = network_error
@@ -164,6 +212,30 @@ class InMemoryYouTubeClient:
             playlists=items,
             quota_cost=_page_cost(len(items)),
             truncated=len(self.playlists) > limit,
+        )
+
+    def list_likes(self, *, limit: int) -> LikeListResult:
+        if self.network_error:
+            raise NetworkError("network failure")
+        if self.quota_exceeded:
+            raise QuotaExceededError("quota exceeded")
+        items = self.likes[:limit]
+        return LikeListResult(
+            likes=items,
+            quota_cost=_page_cost(len(items)),
+            truncated=len(self.likes) > limit,
+        )
+
+    def list_subscriptions(self, *, limit: int) -> SubscriptionListResult:
+        if self.network_error:
+            raise NetworkError("network failure")
+        if self.quota_exceeded:
+            raise QuotaExceededError("quota exceeded")
+        items = self.subscriptions[:limit]
+        return SubscriptionListResult(
+            subscriptions=items,
+            quota_cost=_page_cost(len(items)),
+            truncated=len(self.subscriptions) > limit,
         )
 
 
@@ -295,6 +367,51 @@ class LiveYouTubeClient:
             truncated=truncated,
         )
 
+    def list_likes(self, *, limit: int) -> LikeListResult:
+        result = self.list_playlist_items(LIKED_VIDEOS_PLAYLIST_ID, limit=limit)
+        return LikeListResult(
+            likes=tuple(_liked_video_from_item(item) for item in result.items),
+            quota_cost=result.quota_cost,
+            truncated=result.truncated,
+        )
+
+    def list_subscriptions(self, *, limit: int) -> SubscriptionListResult:
+        subscriptions: list[Subscription] = []
+        quota_cost = 0
+        page_token: str | None = None
+        truncated = False
+        while len(subscriptions) < limit:
+            try:
+                response = self._http.get(
+                    YOUTUBE_SUBSCRIPTIONS_URL,
+                    params=_subscriptions_params(
+                        limit=limit,
+                        already_fetched=len(subscriptions),
+                        page_token=page_token,
+                    ),
+                    headers={"Authorization": f"Bearer {self._access_token}"},
+                )
+            except httpx.RequestError as exc:
+                raise NetworkError("network failure") from exc
+            quota_cost += 1
+            _raise_for_youtube(response)
+            payload = _object_map(response.json())
+            subscriptions.extend(_subscriptions_from_items(payload.get("items")))
+            next_page = payload.get("nextPageToken")
+            next_token = next_page if isinstance(next_page, str) else None
+            if len(subscriptions) >= limit:
+                truncated = len(subscriptions) > limit or bool(next_token)
+                subscriptions = subscriptions[:limit]
+                break
+            if not next_token:
+                break
+            page_token = next_token
+        return SubscriptionListResult(
+            subscriptions=tuple(subscriptions),
+            quota_cost=quota_cost,
+            truncated=truncated,
+        )
+
 
 def _playlists_params(
     *,
@@ -324,6 +441,23 @@ def _playlist_items_params(
     params: dict[str, str | int] = {
         "part": "snippet,contentDetails,status",
         "playlistId": playlist_id,
+        "maxResults": remaining,
+    }
+    if page_token:
+        params["pageToken"] = page_token
+    return params
+
+
+def _subscriptions_params(
+    *,
+    limit: int,
+    already_fetched: int,
+    page_token: str | None,
+) -> dict[str, str | int]:
+    remaining = max(1, min(PAGE_SIZE, limit - already_fetched))
+    params: dict[str, str | int] = {
+        "part": "snippet",
+        "mine": "true",
         "maxResults": remaining,
     }
     if page_token:
@@ -380,6 +514,37 @@ def _playlist_items_from_payload(
             )
         )
     return items
+
+
+def _liked_video_from_item(item: PlaylistItem) -> LikedVideo:
+    return LikedVideo(
+        video_id=item.video_id,
+        title=item.title,
+        channel_title=item.channel_title,
+        available=item.available,
+        position=item.position,
+    )
+
+
+def _subscriptions_from_items(items: object) -> list[Subscription]:
+    subscriptions: list[Subscription] = []
+    for item in _object_list(items):
+        typed_item = _object_map(item)
+        if not typed_item:
+            continue
+        snippet = _object_map(typed_item.get("snippet"))
+        resource = _object_map(snippet.get("resourceId"))
+        channel_id = _as_str(resource.get("channelId"))
+        if not channel_id:
+            continue
+        subscriptions.append(
+            Subscription(
+                channel_id=channel_id,
+                title=_as_str(snippet.get("title")),
+                subscribed_at=_as_str(snippet.get("publishedAt")),
+            )
+        )
+    return subscriptions
 
 
 def _raise_for_youtube(
