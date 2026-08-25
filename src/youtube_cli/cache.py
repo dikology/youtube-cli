@@ -4,9 +4,11 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from youtube_cli.youtube import Playlist, PlaylistItem
+from youtube_cli.youtube import LikedVideo, Playlist, PlaylistItem, Subscription
 
 PLAYLISTS_COLLECTION = "playlists"
+LIKES_COLLECTION = "likes"
+SUBSCRIPTIONS_COLLECTION = "subscriptions"
 
 
 def _items_collection(playlist_id: str) -> str:
@@ -36,6 +38,20 @@ class CachedPlaylist:
 @dataclass(frozen=True)
 class CachedPlaylistItems:
     items: tuple[PlaylistItem, ...]
+    fetched_at: str
+    truncated: bool
+
+
+@dataclass(frozen=True)
+class CachedLikes:
+    likes: tuple[LikedVideo, ...]
+    fetched_at: str
+    truncated: bool
+
+
+@dataclass(frozen=True)
+class CachedSubscriptions:
+    subscriptions: tuple[Subscription, ...]
     fetched_at: str
     truncated: bool
 
@@ -78,14 +94,14 @@ class LibraryCache:
             collections: list[CollectionStatus] = []
             for row in rows:
                 name = row["name"]
-                if name != PLAYLISTS_COLLECTION:
+                count = _collection_count(conn, name)
+                if count is None:
                     continue
-                count_row = conn.execute("SELECT COUNT(*) AS n FROM playlists").fetchone()
                 collections.append(
                     CollectionStatus(
                         name=name,
                         fetched_at=row["fetched_at"],
-                        count=int(count_row["n"]) if count_row is not None else 0,
+                        count=count,
                     )
                 )
             return tuple(collections)
@@ -285,6 +301,132 @@ class LibraryCache:
                 (_items_collection(playlist_id), fetched_at, int(truncated)),
             )
 
+    def load_likes(self) -> CachedLikes | None:
+        conn = self._require_conn()
+        meta = conn.execute(
+            "SELECT fetched_at, truncated FROM collection_meta WHERE name = ?",
+            (LIKES_COLLECTION,),
+        ).fetchone()
+        if meta is None:
+            return None
+        rows = conn.execute(
+            """
+            SELECT position, video_id, title, channel_title, available
+            FROM likes
+            ORDER BY CASE WHEN position IS NULL THEN 1 ELSE 0 END, position, rowid
+            """
+        ).fetchall()
+        return CachedLikes(
+            likes=tuple(
+                LikedVideo(
+                    video_id=row["video_id"],
+                    title=row["title"],
+                    channel_title=row["channel_title"],
+                    available=bool(row["available"]),
+                    position=row["position"],
+                )
+                for row in rows
+            ),
+            fetched_at=meta["fetched_at"],
+            truncated=bool(meta["truncated"]),
+        )
+
+    def replace_likes(
+        self,
+        likes: tuple[LikedVideo, ...],
+        *,
+        fetched_at: str,
+        truncated: bool,
+    ) -> None:
+        conn = self._require_conn()
+        with conn:
+            conn.execute("DELETE FROM likes")
+            conn.executemany(
+                """
+                INSERT INTO likes (position, video_id, title, channel_title, available)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        item.position,
+                        item.video_id,
+                        item.title,
+                        item.channel_title,
+                        int(item.available),
+                    )
+                    for item in likes
+                ],
+            )
+            conn.execute(
+                """
+                INSERT INTO collection_meta (name, fetched_at, truncated)
+                VALUES (?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    fetched_at = excluded.fetched_at,
+                    truncated = excluded.truncated
+                """,
+                (LIKES_COLLECTION, fetched_at, int(truncated)),
+            )
+
+    def load_subscriptions(self) -> CachedSubscriptions | None:
+        conn = self._require_conn()
+        meta = conn.execute(
+            "SELECT fetched_at, truncated FROM collection_meta WHERE name = ?",
+            (SUBSCRIPTIONS_COLLECTION,),
+        ).fetchone()
+        if meta is None:
+            return None
+        rows = conn.execute(
+            """
+            SELECT channel_id, title, subscribed_at
+            FROM subscriptions
+            ORDER BY rowid
+            """
+        ).fetchall()
+        return CachedSubscriptions(
+            subscriptions=tuple(
+                Subscription(
+                    channel_id=row["channel_id"],
+                    title=row["title"],
+                    subscribed_at=row["subscribed_at"],
+                )
+                for row in rows
+            ),
+            fetched_at=meta["fetched_at"],
+            truncated=bool(meta["truncated"]),
+        )
+
+    def replace_subscriptions(
+        self,
+        subscriptions: tuple[Subscription, ...],
+        *,
+        fetched_at: str,
+        truncated: bool,
+    ) -> None:
+        conn = self._require_conn()
+        with conn:
+            conn.execute("DELETE FROM subscriptions")
+            conn.executemany(
+                """
+                INSERT INTO subscriptions (channel_id, title, subscribed_at)
+                VALUES (?, ?, ?)
+                """,
+                [
+                    (item.channel_id, item.title, item.subscribed_at)
+                    for item in subscriptions
+                ],
+            )
+            conn.execute(
+                """
+                INSERT INTO collection_meta (name, fetched_at, truncated)
+                VALUES (?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    fetched_at = excluded.fetched_at,
+                    truncated = excluded.truncated
+                """,
+                (SUBSCRIPTIONS_COLLECTION, fetched_at, int(truncated)),
+            )
+
     def _init_schema(self) -> None:
         conn = self._require_conn()
         conn.executescript(
@@ -311,6 +453,19 @@ class LibraryCache:
                 available INTEGER NOT NULL,
                 PRIMARY KEY (playlist_id, position)
             );
+            CREATE TABLE IF NOT EXISTS likes (
+                position INTEGER,
+                video_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                channel_title TEXT NOT NULL,
+                available INTEGER NOT NULL,
+                PRIMARY KEY (video_id)
+            );
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                channel_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                subscribed_at TEXT NOT NULL
+            );
             """
         )
         self._ensure_column("playlists", "fetched_at", "TEXT NOT NULL DEFAULT ''")
@@ -328,3 +483,15 @@ class LibraryCache:
         if self._conn is None:
             raise RuntimeError("cache is not open")
         return self._conn
+
+
+def _collection_count(conn: sqlite3.Connection, name: str) -> int | None:
+    table = {
+        PLAYLISTS_COLLECTION: "playlists",
+        LIKES_COLLECTION: "likes",
+        SUBSCRIPTIONS_COLLECTION: "subscriptions",
+    }.get(name)
+    if table is None:
+        return None
+    count_row = conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()
+    return int(count_row["n"]) if count_row is not None else 0

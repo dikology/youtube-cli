@@ -105,10 +105,16 @@ def test_lazy_fill_writes_playlists_only(invoke, credentials, youtube, cache_dir
     item_meta = conn.execute(
         "SELECT name FROM collection_meta WHERE name LIKE 'playlist_items:%'"
     ).fetchall()
+    likes_meta = conn.execute(
+        "SELECT 1 FROM collection_meta WHERE name = 'likes'"
+    ).fetchone()
+    subscriptions_meta = conn.execute(
+        "SELECT 1 FROM collection_meta WHERE name = 'subscriptions'"
+    ).fetchone()
     conn.close()
     assert "playlists" in tables
-    assert "likes" not in tables
-    assert "subscriptions" not in tables
+    assert likes_meta is None
+    assert subscriptions_meta is None
     assert item_rows == 0
     assert item_meta == []
 

@@ -25,9 +25,11 @@ from youtube_cli.youtube import (
     LiveYouTubeClient,
     NetworkError,
     NotFoundError,
+    LikedVideo,
     Playlist,
     PlaylistItem,
     QuotaExceededError,
+    Subscription,
     UnauthorizedError,
     YouTubeApiError,
     YouTubeClient,
@@ -114,6 +116,22 @@ class PlaylistItemsRequest:
     limit: int
 
 
+@dataclass(frozen=True)
+class LikesListRequest:
+    table: bool
+    fresh: bool
+    offline: bool
+    limit: int
+
+
+@dataclass(frozen=True)
+class SubsListRequest:
+    table: bool
+    fresh: bool
+    offline: bool
+    limit: int
+
+
 Request = (
     AuthLoginRequest
     | AuthLogoutRequest
@@ -123,6 +141,8 @@ Request = (
     | PlaylistsListRequest
     | PlaylistShowRequest
     | PlaylistItemsRequest
+    | LikesListRequest
+    | SubsListRequest
 )
 
 
@@ -189,6 +209,10 @@ def run(
             return _playlist_show(request, youtube=client, cache=cache, stdout=out)
         if isinstance(request, PlaylistItemsRequest):
             return _playlist_items(request, youtube=client, cache=cache, stdout=out)
+        if isinstance(request, LikesListRequest):
+            return _likes_list(request, youtube=client, cache=cache, stdout=out)
+        if isinstance(request, SubsListRequest):
+            return _subs_list(request, youtube=client, cache=cache, stdout=out)
         return _playlists_list(
             request,
             youtube=client,
@@ -279,6 +303,24 @@ def _parse(argv: list[str]) -> Request:
             raise UsageError("playlist items requires a playlist id")
         return PlaylistItemsRequest(
             playlist_id=args.target,
+            table=args.table,
+            fresh=args.fresh,
+            offline=args.offline,
+            limit=args.limit,
+        )
+    if args.noun == "likes" and args.verb == "list":
+        if args.target:
+            raise UsageError("likes list does not take an id")
+        return LikesListRequest(
+            table=args.table,
+            fresh=args.fresh,
+            offline=args.offline,
+            limit=args.limit,
+        )
+    if args.noun == "subs" and args.verb == "list":
+        if args.target:
+            raise UsageError("subs list does not take an id")
+        return SubsListRequest(
             table=args.table,
             fresh=args.fresh,
             offline=args.offline,
@@ -715,6 +757,103 @@ def _playlists_list(
     return 0
 
 
+def _likes_list(
+    request: LikesListRequest,
+    *,
+    youtube: YouTubeClient,
+    cache: LibraryCache,
+    stdout: TextIO,
+) -> int:
+    if not request.fresh:
+        cached = cache.load_likes()
+        if cached is not None:
+            likes = cached.likes[: request.limit]
+            _emit_likes(
+                stdout,
+                likes=likes,
+                table=request.table,
+                meta={
+                    "from_cache": True,
+                    "fetched_at": cached.fetched_at,
+                    "truncated": cached.truncated or len(cached.likes) > request.limit,
+                    "limit": request.limit,
+                },
+            )
+            return 0
+        if request.offline:
+            raise CacheEmptyError("likes cache is empty; run without --offline")
+
+    fetched_at = _now_iso()
+    result = youtube.list_likes(limit=request.limit)
+    cache.replace_likes(
+        result.likes,
+        fetched_at=fetched_at,
+        truncated=result.truncated,
+    )
+    _emit_likes(
+        stdout,
+        likes=result.likes,
+        table=request.table,
+        meta={
+            "from_cache": False,
+            "fetched_at": fetched_at,
+            "truncated": result.truncated,
+            "limit": request.limit,
+            "quota_cost": result.quota_cost,
+        },
+    )
+    return 0
+
+
+def _subs_list(
+    request: SubsListRequest,
+    *,
+    youtube: YouTubeClient,
+    cache: LibraryCache,
+    stdout: TextIO,
+) -> int:
+    if not request.fresh:
+        cached = cache.load_subscriptions()
+        if cached is not None:
+            subscriptions = cached.subscriptions[: request.limit]
+            _emit_subscriptions(
+                stdout,
+                subscriptions=subscriptions,
+                table=request.table,
+                meta={
+                    "from_cache": True,
+                    "fetched_at": cached.fetched_at,
+                    "truncated": cached.truncated
+                    or len(cached.subscriptions) > request.limit,
+                    "limit": request.limit,
+                },
+            )
+            return 0
+        if request.offline:
+            raise CacheEmptyError("subscriptions cache is empty; run without --offline")
+
+    fetched_at = _now_iso()
+    result = youtube.list_subscriptions(limit=request.limit)
+    cache.replace_subscriptions(
+        result.subscriptions,
+        fetched_at=fetched_at,
+        truncated=result.truncated,
+    )
+    _emit_subscriptions(
+        stdout,
+        subscriptions=result.subscriptions,
+        table=request.table,
+        meta={
+            "from_cache": False,
+            "fetched_at": fetched_at,
+            "truncated": result.truncated,
+            "limit": request.limit,
+            "quota_cost": result.quota_cost,
+        },
+    )
+    return 0
+
+
 def _playlist_payload(playlist: Playlist) -> dict[str, str | int]:
     return {
         "id": playlist.id,
@@ -784,13 +923,89 @@ def _emit_playlist_items(
     out.write("\n")
 
 
-def _write_items_table(out: TextIO, items: tuple[PlaylistItem, ...]) -> None:
+def _liked_payload(item: LikedVideo) -> dict[str, str | int | bool | None]:
+    return {
+        "video_id": item.video_id,
+        "title": item.title,
+        "channel_title": item.channel_title,
+        "available": item.available,
+        "position": item.position,
+        "url": item.url,
+    }
+
+
+def _emit_likes(
+    out: TextIO,
+    *,
+    likes: tuple[LikedVideo, ...],
+    table: bool,
+    meta: dict[str, object],
+) -> None:
+    if table:
+        _write_items_table(out, likes)
+        return
+    json.dump(
+        {
+            "ok": True,
+            "data": {"likes": [_liked_payload(item) for item in likes]},
+            "meta": meta,
+        },
+        out,
+    )
+    out.write("\n")
+
+
+def _write_items_table(
+    out: TextIO, items: tuple[PlaylistItem, ...] | tuple[LikedVideo, ...]
+) -> None:
     out.write("video_id\ttitle\tchannel_title\tavailable\n")
     for item in items:
         out.write(
             f"{item.video_id}\t{item.title}\t{item.channel_title}\t"
             f"{_table_cell(item.available)}\n"
         )
+
+
+def _subscription_payload(item: Subscription) -> dict[str, str]:
+    return {
+        "channel_id": item.channel_id,
+        "title": item.title,
+        "subscribed_at": item.subscribed_at,
+        "url": item.url,
+    }
+
+
+def _emit_subscriptions(
+    out: TextIO,
+    *,
+    subscriptions: tuple[Subscription, ...],
+    table: bool,
+    meta: dict[str, object],
+) -> None:
+    if table:
+        _write_subscriptions_table(out, subscriptions)
+        return
+    json.dump(
+        {
+            "ok": True,
+            "data": {
+                "subscriptions": [
+                    _subscription_payload(item) for item in subscriptions
+                ]
+            },
+            "meta": meta,
+        },
+        out,
+    )
+    out.write("\n")
+
+
+def _write_subscriptions_table(
+    out: TextIO, subscriptions: tuple[Subscription, ...]
+) -> None:
+    out.write("channel_id\ttitle\tsubscribed_at\n")
+    for item in subscriptions:
+        out.write(f"{item.channel_id}\t{item.title}\t{item.subscribed_at}\n")
 
 
 def _emit_playlists(
