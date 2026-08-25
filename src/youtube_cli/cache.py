@@ -4,9 +4,13 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from youtube_cli.youtube import Playlist
+from youtube_cli.youtube import Playlist, PlaylistItem
 
 PLAYLISTS_COLLECTION = "playlists"
+
+
+def _items_collection(playlist_id: str) -> str:
+    return f"playlist_items:{playlist_id}"
 
 
 @dataclass(frozen=True)
@@ -19,6 +23,19 @@ class CollectionStatus:
 @dataclass(frozen=True)
 class CachedPlaylists:
     playlists: tuple[Playlist, ...]
+    fetched_at: str
+    truncated: bool
+
+
+@dataclass(frozen=True)
+class CachedPlaylist:
+    playlist: Playlist
+    fetched_at: str
+
+
+@dataclass(frozen=True)
+class CachedPlaylistItems:
+    items: tuple[PlaylistItem, ...]
     fetched_at: str
     truncated: bool
 
@@ -106,6 +123,53 @@ class LibraryCache:
             truncated=bool(meta["truncated"]),
         )
 
+    def load_playlist(self, playlist_id: str) -> CachedPlaylist | None:
+        conn = self._require_conn()
+        row = conn.execute(
+            """
+            SELECT id, title, item_count, privacy, channel_id, fetched_at
+            FROM playlists
+            WHERE id = ?
+            """,
+            (playlist_id,),
+        ).fetchone()
+        if row is None or not row["fetched_at"]:
+            return None
+        return CachedPlaylist(
+            playlist=Playlist(
+                id=row["id"],
+                title=row["title"],
+                item_count=row["item_count"],
+                privacy=row["privacy"],
+                channel_id=row["channel_id"],
+            ),
+            fetched_at=row["fetched_at"],
+        )
+
+    def upsert_playlist(self, playlist: Playlist, *, fetched_at: str) -> None:
+        conn = self._require_conn()
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO playlists (id, title, item_count, privacy, channel_id, fetched_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    title = excluded.title,
+                    item_count = excluded.item_count,
+                    privacy = excluded.privacy,
+                    channel_id = excluded.channel_id,
+                    fetched_at = excluded.fetched_at
+                """,
+                (
+                    playlist.id,
+                    playlist.title,
+                    playlist.item_count,
+                    playlist.privacy,
+                    playlist.channel_id,
+                    fetched_at,
+                ),
+            )
+
     def replace_playlists(
         self,
         playlists: tuple[Playlist, ...],
@@ -118,8 +182,8 @@ class LibraryCache:
             conn.execute("DELETE FROM playlists")
             conn.executemany(
                 """
-                INSERT INTO playlists (id, title, item_count, privacy, channel_id)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO playlists (id, title, item_count, privacy, channel_id, fetched_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -128,6 +192,7 @@ class LibraryCache:
                         playlist.item_count,
                         playlist.privacy,
                         playlist.channel_id,
+                        fetched_at,
                     )
                     for playlist in playlists
                 ],
@@ -141,6 +206,83 @@ class LibraryCache:
                     truncated = excluded.truncated
                 """,
                 (PLAYLISTS_COLLECTION, fetched_at, int(truncated)),
+            )
+
+    def load_playlist_items(self, playlist_id: str) -> CachedPlaylistItems | None:
+        conn = self._require_conn()
+        meta = conn.execute(
+            "SELECT fetched_at, truncated FROM collection_meta WHERE name = ?",
+            (_items_collection(playlist_id),),
+        ).fetchone()
+        if meta is None:
+            return None
+        rows = conn.execute(
+            """
+            SELECT playlist_id, position, video_id, title, channel_title, available
+            FROM playlist_items
+            WHERE playlist_id = ?
+            ORDER BY position
+            """,
+            (playlist_id,),
+        ).fetchall()
+        return CachedPlaylistItems(
+            items=tuple(
+                PlaylistItem(
+                    playlist_id=row["playlist_id"],
+                    position=row["position"],
+                    video_id=row["video_id"],
+                    title=row["title"],
+                    channel_title=row["channel_title"],
+                    available=bool(row["available"]),
+                )
+                for row in rows
+            ),
+            fetched_at=meta["fetched_at"],
+            truncated=bool(meta["truncated"]),
+        )
+
+    def replace_playlist_items(
+        self,
+        playlist_id: str,
+        items: tuple[PlaylistItem, ...],
+        *,
+        fetched_at: str,
+        truncated: bool,
+    ) -> None:
+        conn = self._require_conn()
+        with conn:
+            conn.execute(
+                "DELETE FROM playlist_items WHERE playlist_id = ?",
+                (playlist_id,),
+            )
+            conn.executemany(
+                """
+                INSERT INTO playlist_items (
+                    playlist_id, position, video_id, title, channel_title, available
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        item.playlist_id,
+                        item.position,
+                        item.video_id,
+                        item.title,
+                        item.channel_title,
+                        int(item.available),
+                    )
+                    for item in items
+                ],
+            )
+            conn.execute(
+                """
+                INSERT INTO collection_meta (name, fetched_at, truncated)
+                VALUES (?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    fetched_at = excluded.fetched_at,
+                    truncated = excluded.truncated
+                """,
+                (_items_collection(playlist_id), fetched_at, int(truncated)),
             )
 
     def _init_schema(self) -> None:
@@ -157,10 +299,30 @@ class LibraryCache:
                 title TEXT NOT NULL,
                 item_count INTEGER NOT NULL,
                 privacy TEXT NOT NULL,
-                channel_id TEXT NOT NULL
+                channel_id TEXT NOT NULL,
+                fetched_at TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS playlist_items (
+                playlist_id TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                video_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                channel_title TEXT NOT NULL,
+                available INTEGER NOT NULL,
+                PRIMARY KEY (playlist_id, position)
             );
             """
         )
+        self._ensure_column("playlists", "fetched_at", "TEXT NOT NULL DEFAULT ''")
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        conn = self._require_conn()
+        columns = {
+            row[1]
+            for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in columns:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def _require_conn(self) -> sqlite3.Connection:
         if self._conn is None:
