@@ -144,6 +144,13 @@ class VideoGetRequest:
     limit: int
 
 
+@dataclass(frozen=True)
+class SyncCollectionRequest:
+    collection: str
+    limit: int
+    playlist_id: str | None = None
+
+
 Request = (
     AuthLoginRequest
     | AuthLogoutRequest
@@ -156,6 +163,7 @@ Request = (
     | LikesListRequest
     | SubsListRequest
     | VideoGetRequest
+    | SyncCollectionRequest
 )
 
 
@@ -228,6 +236,8 @@ def run(
             return _subs_list(request, youtube=client, cache=cache, stdout=out)
         if isinstance(request, VideoGetRequest):
             return _video_get(request, youtube=client, cache=cache, stdout=out)
+        if isinstance(request, SyncCollectionRequest):
+            return _sync_collection(request, youtube=client, cache=cache, stdout=out)
         return _playlists_list(
             request,
             youtube=client,
@@ -351,6 +361,28 @@ def _parse(argv: list[str]) -> Request:
             table=args.table,
             fresh=args.fresh,
             offline=args.offline,
+            limit=args.limit,
+        )
+    if args.noun == "sync" and args.offline:
+        raise UsageError("sync cannot be used with --offline")
+    if args.noun == "sync" and args.verb is None:
+        return SyncCollectionRequest(
+            collection="library",
+            limit=args.limit,
+        )
+    if args.noun == "sync" and args.verb == "playlist":
+        if not args.target:
+            raise UsageError("sync playlist requires a playlist id")
+        return SyncCollectionRequest(
+            collection="playlist",
+            limit=args.limit,
+            playlist_id=args.target,
+        )
+    if args.noun == "sync" and args.verb in {"likes", "subs", "playlists"}:
+        if args.target:
+            raise UsageError(f"sync {args.verb} does not take an id")
+        return SyncCollectionRequest(
+            collection=args.verb,
             limit=args.limit,
         )
     raise UsageError(f"unknown command: {' '.join(argv)}")
@@ -744,6 +776,115 @@ def _playlist_items(
         table=request.table,
         meta=meta,
     )
+    return 0
+
+
+def _sync_collection(
+    request: SyncCollectionRequest,
+    *,
+    youtube: YouTubeClient,
+    cache: LibraryCache,
+    stdout: TextIO,
+) -> int:
+    fetched_at = _now_iso()
+    if request.collection == "likes":
+        result = youtube.list_likes(limit=request.limit)
+        cache.replace_likes(
+            result.likes,
+            fetched_at=fetched_at,
+            truncated=result.truncated,
+        )
+        quota_cost = result.quota_cost
+        truncated = result.truncated
+        collections = ["likes"]
+    elif request.collection == "subs":
+        result = youtube.list_subscriptions(limit=request.limit)
+        cache.replace_subscriptions(
+            result.subscriptions,
+            fetched_at=fetched_at,
+            truncated=result.truncated,
+        )
+        quota_cost = result.quota_cost
+        truncated = result.truncated
+        collections = ["subscriptions"]
+    elif request.collection == "playlist":
+        playlist_id = request.playlist_id
+        if playlist_id is None:
+            raise UsageError("sync playlist requires a playlist id")
+        result = youtube.list_playlist_items(playlist_id, limit=request.limit)
+        cache.replace_playlist_items(
+            playlist_id,
+            result.items,
+            fetched_at=fetched_at,
+            truncated=result.truncated,
+        )
+        quota_cost = result.quota_cost
+        truncated = result.truncated
+        collections = [f"playlist_items:{playlist_id}"]
+    elif request.collection == "library":
+        playlists_result = youtube.list_playlists(limit=request.limit)
+        quota_cost = playlists_result.quota_cost
+        truncated = playlists_result.truncated
+        items_by_playlist: dict[str, tuple[PlaylistItem, ...]] = {}
+        items_truncated: dict[str, bool] = {}
+        for playlist in playlists_result.playlists:
+            items_result = youtube.list_playlist_items(
+                playlist.id, limit=request.limit
+            )
+            items_by_playlist[playlist.id] = items_result.items
+            items_truncated[playlist.id] = items_result.truncated
+            quota_cost += items_result.quota_cost
+            truncated = truncated or items_result.truncated
+        likes_result = youtube.list_likes(limit=request.limit)
+        quota_cost += likes_result.quota_cost
+        truncated = truncated or likes_result.truncated
+        subs_result = youtube.list_subscriptions(limit=request.limit)
+        quota_cost += subs_result.quota_cost
+        truncated = truncated or subs_result.truncated
+        cache.replace_library(
+            playlists=playlists_result.playlists,
+            items_by_playlist=items_by_playlist,
+            likes=likes_result.likes,
+            subscriptions=subs_result.subscriptions,
+            fetched_at=fetched_at,
+            playlists_truncated=playlists_result.truncated,
+            items_truncated=items_truncated,
+            likes_truncated=likes_result.truncated,
+            subscriptions_truncated=subs_result.truncated,
+        )
+        collections = [
+            "playlists",
+            *[f"playlist_items:{playlist_id}" for playlist_id in items_by_playlist],
+            "likes",
+            "subscriptions",
+        ]
+    elif request.collection == "playlists":
+        result = youtube.list_playlists(limit=request.limit)
+        cache.replace_playlists(
+            result.playlists,
+            fetched_at=fetched_at,
+            truncated=result.truncated,
+        )
+        quota_cost = result.quota_cost
+        truncated = result.truncated
+        collections = ["playlists"]
+    else:
+        raise UsageError(f"unknown command: sync {request.collection}")
+    json.dump(
+        {
+            "ok": True,
+            "data": {"collections": collections},
+            "meta": {
+                "from_cache": False,
+                "fetched_at": fetched_at,
+                "truncated": truncated,
+                "limit": request.limit,
+                "quota_cost": quota_cost,
+            },
+        },
+        stdout,
+    )
+    stdout.write("\n")
     return 0
 
 
