@@ -31,6 +31,7 @@ from youtube_cli.youtube import (
     QuotaExceededError,
     Subscription,
     UnauthorizedError,
+    Video,
     YouTubeApiError,
     YouTubeClient,
 )
@@ -114,6 +115,7 @@ class PlaylistItemsRequest:
     fresh: bool
     offline: bool
     limit: int
+    hydrate: bool
 
 
 @dataclass(frozen=True)
@@ -122,10 +124,20 @@ class LikesListRequest:
     fresh: bool
     offline: bool
     limit: int
+    hydrate: bool
 
 
 @dataclass(frozen=True)
 class SubsListRequest:
+    table: bool
+    fresh: bool
+    offline: bool
+    limit: int
+
+
+@dataclass(frozen=True)
+class VideoGetRequest:
+    video_id: str
     table: bool
     fresh: bool
     offline: bool
@@ -143,6 +155,7 @@ Request = (
     | PlaylistItemsRequest
     | LikesListRequest
     | SubsListRequest
+    | VideoGetRequest
 )
 
 
@@ -213,6 +226,8 @@ def run(
             return _likes_list(request, youtube=client, cache=cache, stdout=out)
         if isinstance(request, SubsListRequest):
             return _subs_list(request, youtube=client, cache=cache, stdout=out)
+        if isinstance(request, VideoGetRequest):
+            return _video_get(request, youtube=client, cache=cache, stdout=out)
         return _playlists_list(
             request,
             youtube=client,
@@ -307,6 +322,7 @@ def _parse(argv: list[str]) -> Request:
             fresh=args.fresh,
             offline=args.offline,
             limit=args.limit,
+            hydrate=args.hydrate,
         )
     if args.noun == "likes" and args.verb == "list":
         if args.target:
@@ -316,11 +332,22 @@ def _parse(argv: list[str]) -> Request:
             fresh=args.fresh,
             offline=args.offline,
             limit=args.limit,
+            hydrate=args.hydrate,
         )
     if args.noun == "subs" and args.verb == "list":
         if args.target:
             raise UsageError("subs list does not take an id")
         return SubsListRequest(
+            table=args.table,
+            fresh=args.fresh,
+            offline=args.offline,
+            limit=args.limit,
+        )
+    if args.noun == "video" and args.verb == "get":
+        if not args.target:
+            raise UsageError("video get requires a video id")
+        return VideoGetRequest(
+            video_id=args.target,
             table=args.table,
             fresh=args.fresh,
             offline=args.offline,
@@ -339,6 +366,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--wipe", action="store_true")
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
+    parser.add_argument("--hydrate", action="store_true")
 
     def error(message: str) -> None:
         raise UsageError(message)
@@ -663,48 +691,58 @@ def _playlist_items(
     cache: LibraryCache,
     stdout: TextIO,
 ) -> int:
-    if not request.fresh:
-        cached = cache.load_playlist_items(request.playlist_id)
-        if cached is not None:
-            items = cached.items[: request.limit]
-            _emit_playlist_items(
-                stdout,
-                items=items,
-                table=request.table,
-                meta={
-                    "from_cache": True,
-                    "fetched_at": cached.fetched_at,
-                    "truncated": cached.truncated or len(cached.items) > request.limit,
-                    "limit": request.limit,
-                },
-            )
-            return 0
-        if request.offline:
-            raise OfflineMissError(
-                "playlist items are not in the cache; run without --offline"
-            )
+    cached = None if request.fresh else cache.load_playlist_items(request.playlist_id)
+    if cached is not None:
+        items = cached.items[: request.limit]
+        fetched_at = cached.fetched_at
+        truncated = cached.truncated or len(cached.items) > request.limit
+        from_cache = True
+        quota_cost = 0
+    elif request.offline:
+        raise OfflineMissError(
+            "playlist items are not in the cache; run without --offline"
+        )
+    else:
+        fetched_at = _now_iso()
+        result = youtube.list_playlist_items(
+            request.playlist_id, limit=request.limit
+        )
+        cache.replace_playlist_items(
+            request.playlist_id,
+            result.items,
+            fetched_at=fetched_at,
+            truncated=result.truncated,
+        )
+        items = result.items
+        truncated = result.truncated
+        from_cache = False
+        quota_cost = result.quota_cost
 
-    fetched_at = _now_iso()
-    result = youtube.list_playlist_items(
-        request.playlist_id, limit=request.limit
-    )
-    cache.replace_playlist_items(
-        request.playlist_id,
-        result.items,
-        fetched_at=fetched_at,
-        truncated=result.truncated,
-    )
+    if request.hydrate:
+        video_quota = _hydrate_videos(
+            tuple(item.video_id for item in items if item.available and item.video_id),
+            youtube=youtube,
+            cache=cache,
+            fresh=request.fresh,
+            offline=request.offline,
+        )
+        if video_quota:
+            quota_cost += video_quota
+            from_cache = False
+
+    meta: dict[str, object] = {
+        "from_cache": from_cache,
+        "fetched_at": fetched_at,
+        "truncated": truncated,
+        "limit": request.limit,
+    }
+    if quota_cost:
+        meta["quota_cost"] = quota_cost
     _emit_playlist_items(
         stdout,
-        items=result.items,
+        items=items,
         table=request.table,
-        meta={
-            "from_cache": False,
-            "fetched_at": fetched_at,
-            "truncated": result.truncated,
-            "limit": request.limit,
-            "quota_cost": result.quota_cost,
-        },
+        meta=meta,
     )
     return 0
 
@@ -764,40 +802,121 @@ def _likes_list(
     cache: LibraryCache,
     stdout: TextIO,
 ) -> int:
+    cached = None if request.fresh else cache.load_likes()
+    if cached is not None:
+        likes = cached.likes[: request.limit]
+        fetched_at = cached.fetched_at
+        truncated = cached.truncated or len(cached.likes) > request.limit
+        from_cache = True
+        quota_cost = 0
+    elif request.offline:
+        raise CacheEmptyError("likes cache is empty; run without --offline")
+    else:
+        fetched_at = _now_iso()
+        result = youtube.list_likes(limit=request.limit)
+        cache.replace_likes(
+            result.likes,
+            fetched_at=fetched_at,
+            truncated=result.truncated,
+        )
+        likes = result.likes
+        truncated = result.truncated
+        from_cache = False
+        quota_cost = result.quota_cost
+
+    if request.hydrate:
+        video_quota = _hydrate_videos(
+            tuple(item.video_id for item in likes if item.available and item.video_id),
+            youtube=youtube,
+            cache=cache,
+            fresh=request.fresh,
+            offline=request.offline,
+        )
+        if video_quota:
+            quota_cost += video_quota
+            from_cache = False
+
+    meta: dict[str, object] = {
+        "from_cache": from_cache,
+        "fetched_at": fetched_at,
+        "truncated": truncated,
+        "limit": request.limit,
+    }
+    if quota_cost:
+        meta["quota_cost"] = quota_cost
+    _emit_likes(
+        stdout,
+        likes=likes,
+        table=request.table,
+        meta=meta,
+    )
+    return 0
+
+
+def _hydrate_videos(
+    video_ids: tuple[str, ...],
+    *,
+    youtube: YouTubeClient,
+    cache: LibraryCache,
+    fresh: bool,
+    offline: bool,
+) -> int:
+    unique_ids = tuple(dict.fromkeys(video_id for video_id in video_ids if video_id))
+    if not unique_ids:
+        return 0
+    if fresh and not offline:
+        to_fetch = unique_ids
+    else:
+        to_fetch = cache.missing_video_ids(unique_ids)
+    if not to_fetch:
+        return 0
+    if offline:
+        raise OfflineMissError("videos are not in the cache; run without --offline")
+    fetched_at = _now_iso()
+    result = youtube.list_videos(to_fetch)
+    cache.upsert_videos(result.videos, fetched_at=fetched_at)
+    return result.quota_cost
+
+
+def _video_get(
+    request: VideoGetRequest,
+    *,
+    youtube: YouTubeClient,
+    cache: LibraryCache,
+    stdout: TextIO,
+) -> int:
     if not request.fresh:
-        cached = cache.load_likes()
+        cached = cache.load_video(request.video_id)
         if cached is not None:
-            likes = cached.likes[: request.limit]
-            _emit_likes(
+            _emit_video(
                 stdout,
-                likes=likes,
+                video=cached.video,
                 table=request.table,
                 meta={
                     "from_cache": True,
                     "fetched_at": cached.fetched_at,
-                    "truncated": cached.truncated or len(cached.likes) > request.limit,
+                    "truncated": False,
                     "limit": request.limit,
                 },
             )
             return 0
         if request.offline:
-            raise CacheEmptyError("likes cache is empty; run without --offline")
+            raise OfflineMissError("video is not in the cache; run without --offline")
 
     fetched_at = _now_iso()
-    result = youtube.list_likes(limit=request.limit)
-    cache.replace_likes(
-        result.likes,
-        fetched_at=fetched_at,
-        truncated=result.truncated,
-    )
-    _emit_likes(
+    result = youtube.list_videos((request.video_id,))
+    if not result.videos:
+        raise NotFoundError(f"video {request.video_id} not found")
+    video = result.videos[0]
+    cache.upsert_video(video, fetched_at=fetched_at)
+    _emit_video(
         stdout,
-        likes=result.likes,
+        video=video,
         table=request.table,
         meta={
             "from_cache": False,
             "fetched_at": fetched_at,
-            "truncated": result.truncated,
+            "truncated": False,
             "limit": request.limit,
             "quota_cost": result.quota_cost,
         },
@@ -1035,6 +1154,50 @@ def _write_table(out: TextIO, playlists: tuple[Playlist, ...]) -> None:
         out.write(
             f"{playlist.id}\t{playlist.title}\t{playlist.item_count}\t{playlist.privacy}\n"
         )
+
+
+def _video_payload(video: Video) -> dict[str, str | int | bool]:
+    return {
+        "id": video.id,
+        "title": video.title,
+        "channel_id": video.channel_id,
+        "channel_title": video.channel_title,
+        "description": video.description,
+        "duration_seconds": video.duration_seconds,
+        "published_at": video.published_at,
+        "privacy": video.privacy,
+        "available": video.available,
+        "url": video.url,
+    }
+
+
+def _emit_video(
+    out: TextIO,
+    *,
+    video: Video,
+    table: bool,
+    meta: dict[str, object],
+) -> None:
+    if table:
+        _write_video_table(out, video)
+        return
+    json.dump(
+        {
+            "ok": True,
+            "data": _video_payload(video),
+            "meta": meta,
+        },
+        out,
+    )
+    out.write("\n")
+
+
+def _write_video_table(out: TextIO, video: Video) -> None:
+    out.write("id\ttitle\tchannel_title\tduration_seconds\tpublished_at\n")
+    out.write(
+        f"{video.id}\t{video.title}\t{video.channel_title}\t"
+        f"{video.duration_seconds}\t{video.published_at}\n"
+    )
 
 
 def _write_error(out: TextIO, *, code: str, message: str) -> None:

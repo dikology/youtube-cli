@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Protocol, cast
 
@@ -9,6 +10,7 @@ YOUTUBE_PLAYLISTS_URL = "https://www.googleapis.com/youtube/v3/playlists"
 YOUTUBE_PLAYLIST_ITEMS_URL = "https://www.googleapis.com/youtube/v3/playlistItems"
 YOUTUBE_CHANNELS_URL = "https://www.googleapis.com/youtube/v3/channels"
 YOUTUBE_SUBSCRIPTIONS_URL = "https://www.googleapis.com/youtube/v3/subscriptions"
+YOUTUBE_VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
 PAGE_SIZE = 50
 UNAVAILABLE_TITLES = frozenset({"Deleted video", "Private video"})
 LIKED_VIDEOS_PLAYLIST_ID = "LL"
@@ -72,6 +74,23 @@ class Subscription:
 
 
 @dataclass(frozen=True)
+class Video:
+    id: str
+    title: str
+    channel_id: str
+    channel_title: str
+    description: str
+    duration_seconds: int
+    published_at: str
+    privacy: str
+    available: bool
+
+    @property
+    def url(self) -> str:
+        return f"https://www.youtube.com/watch?v={self.id}"
+
+
+@dataclass(frozen=True)
 class PlaylistListResult:
     playlists: tuple[Playlist, ...]
     quota_cost: int
@@ -105,6 +124,12 @@ class SubscriptionListResult:
     truncated: bool
 
 
+@dataclass(frozen=True)
+class VideoListResult:
+    videos: tuple[Video, ...]
+    quota_cost: int
+
+
 class YouTubeClient(Protocol):
     def list_playlists(self, *, limit: int) -> PlaylistListResult: ...
 
@@ -117,6 +142,8 @@ class YouTubeClient(Protocol):
     def list_likes(self, *, limit: int) -> LikeListResult: ...
 
     def list_subscriptions(self, *, limit: int) -> SubscriptionListResult: ...
+
+    def list_videos(self, video_ids: tuple[str, ...]) -> VideoListResult: ...
 
     def get_mine_channel(self) -> Channel: ...
 
@@ -149,6 +176,7 @@ class InMemoryYouTubeClient:
         items: dict[str, tuple[PlaylistItem, ...]] | None = None,
         likes: tuple[LikedVideo, ...] = (),
         subscriptions: tuple[Subscription, ...] = (),
+        videos: tuple[Video, ...] = (),
         channel: Channel | None = None,
         quota_exceeded: bool = False,
         network_error: bool = False,
@@ -158,6 +186,8 @@ class InMemoryYouTubeClient:
         self.items_by_playlist = items or {}
         self.likes = likes
         self.subscriptions = subscriptions
+        self.videos = {video.id: video for video in videos}
+        self.video_list_calls: list[tuple[str, ...]] = []
         self.channel = channel or Channel(id="UCmine", title="Fixture Channel")
         self.quota_exceeded = quota_exceeded
         self.network_error = network_error
@@ -237,6 +267,19 @@ class InMemoryYouTubeClient:
             quota_cost=_page_cost(len(items)),
             truncated=len(self.subscriptions) > limit,
         )
+
+    def list_videos(self, video_ids: tuple[str, ...]) -> VideoListResult:
+        self.video_list_calls.append(video_ids)
+        if self.network_error:
+            raise NetworkError("network failure")
+        if self.quota_exceeded:
+            raise QuotaExceededError("quota exceeded")
+        if not video_ids:
+            return VideoListResult(videos=(), quota_cost=0)
+        found = tuple(
+            self.videos[video_id] for video_id in video_ids if video_id in self.videos
+        )
+        return VideoListResult(videos=found, quota_cost=_page_cost(len(video_ids)))
 
 
 class LiveYouTubeClient:
@@ -412,6 +455,31 @@ class LiveYouTubeClient:
             truncated=truncated,
         )
 
+    def list_videos(self, video_ids: tuple[str, ...]) -> VideoListResult:
+        if not video_ids:
+            return VideoListResult(videos=(), quota_cost=0)
+        videos: list[Video] = []
+        quota_cost = 0
+        for offset in range(0, len(video_ids), PAGE_SIZE):
+            batch = video_ids[offset : offset + PAGE_SIZE]
+            try:
+                response = self._http.get(
+                    YOUTUBE_VIDEOS_URL,
+                    params={
+                        "part": "snippet,contentDetails,status",
+                        "id": ",".join(batch),
+                        "maxResults": len(batch),
+                    },
+                    headers={"Authorization": f"Bearer {self._access_token}"},
+                )
+            except httpx.RequestError as exc:
+                raise NetworkError("network failure") from exc
+            quota_cost += 1
+            _raise_for_youtube(response, forbidden_is_not_found=True)
+            payload = _object_map(response.json())
+            videos.extend(_videos_from_items(payload.get("items")))
+        return VideoListResult(videos=tuple(videos), quota_cost=quota_cost)
+
 
 def _playlists_params(
     *,
@@ -547,6 +615,50 @@ def _subscriptions_from_items(items: object) -> list[Subscription]:
     return subscriptions
 
 
+_ISO_DURATION = re.compile(
+    r"^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$"
+)
+
+
+def _videos_from_items(items: object) -> list[Video]:
+    videos: list[Video] = []
+    for item in _object_list(items):
+        typed_item = _object_map(item)
+        if not typed_item:
+            continue
+        video_id = typed_item.get("id")
+        if not isinstance(video_id, str) or not video_id:
+            continue
+        snippet = _object_map(typed_item.get("snippet"))
+        content = _object_map(typed_item.get("contentDetails"))
+        status = _object_map(typed_item.get("status"))
+        title = _as_str(snippet.get("title"))
+        videos.append(
+            Video(
+                id=video_id,
+                title=title,
+                channel_id=_as_str(snippet.get("channelId")),
+                channel_title=_as_str(snippet.get("channelTitle")),
+                description=_as_str(snippet.get("description")),
+                duration_seconds=_duration_seconds(_as_str(content.get("duration"))),
+                published_at=_as_str(snippet.get("publishedAt")),
+                privacy=_as_str(status.get("privacyStatus"), "private"),
+                available=title not in UNAVAILABLE_TITLES,
+            )
+        )
+    return videos
+
+
+def _duration_seconds(value: str) -> int:
+    match = _ISO_DURATION.match(value)
+    if not match:
+        return 0
+    days, hours, minutes, seconds = (
+        int(part) if part else 0 for part in match.groups()
+    )
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
+
+
 def _raise_for_youtube(
     response: httpx.Response, *, forbidden_is_not_found: bool = False
 ) -> None:
@@ -576,7 +688,13 @@ def _is_quota_error(response: httpx.Response) -> bool:
 def _is_not_found_error(response: httpx.Response) -> bool:
     reasons = _youtube_error_reasons(response)
     return any(
-        reason in {"playlistNotFound", "playlistItemsNotAccessible", "notFound"}
+        reason
+        in {
+            "playlistNotFound",
+            "playlistItemsNotAccessible",
+            "notFound",
+            "videoNotFound",
+        }
         for reason in reasons
     )
 

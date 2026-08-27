@@ -46,6 +46,12 @@ def test_subs_without_list_returns_usage(invoke) -> None:
     _assert_usage(result)
 
 
+def test_video_without_get_returns_usage(invoke) -> None:
+    result = invoke(["video"])
+
+    _assert_usage(result)
+
+
 def test_unknown_flag_returns_usage(invoke) -> None:
     result = invoke(["playlists", "list", "--json"])
 
