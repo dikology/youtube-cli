@@ -4,7 +4,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from youtube_cli.youtube import LikedVideo, Playlist, PlaylistItem, Subscription
+from youtube_cli.youtube import LikedVideo, Playlist, PlaylistItem, Subscription, Video
 
 PLAYLISTS_COLLECTION = "playlists"
 LIKES_COLLECTION = "likes"
@@ -54,6 +54,12 @@ class CachedSubscriptions:
     subscriptions: tuple[Subscription, ...]
     fetched_at: str
     truncated: bool
+
+
+@dataclass(frozen=True)
+class CachedVideo:
+    video: Video
+    fetched_at: str
 
 
 class LibraryCache:
@@ -427,6 +433,87 @@ class LibraryCache:
                 (SUBSCRIPTIONS_COLLECTION, fetched_at, int(truncated)),
             )
 
+    def load_video(self, video_id: str) -> CachedVideo | None:
+        conn = self._require_conn()
+        row = conn.execute(
+            """
+            SELECT id, title, channel_id, channel_title, description,
+                   duration_seconds, published_at, privacy, available, fetched_at
+            FROM videos
+            WHERE id = ?
+            """,
+            (video_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return CachedVideo(
+            video=Video(
+                id=row["id"],
+                title=row["title"],
+                channel_id=row["channel_id"],
+                channel_title=row["channel_title"],
+                description=row["description"],
+                duration_seconds=row["duration_seconds"],
+                published_at=row["published_at"],
+                privacy=row["privacy"],
+                available=bool(row["available"]),
+            ),
+            fetched_at=row["fetched_at"],
+        )
+
+    def missing_video_ids(self, video_ids: tuple[str, ...]) -> tuple[str, ...]:
+        if not video_ids:
+            return ()
+        conn = self._require_conn()
+        placeholders = ",".join("?" * len(video_ids))
+        rows = conn.execute(
+            f"SELECT id FROM videos WHERE id IN ({placeholders})",
+            video_ids,
+        ).fetchall()
+        present = {row["id"] for row in rows}
+        return tuple(video_id for video_id in video_ids if video_id not in present)
+
+    def upsert_video(self, video: Video, *, fetched_at: str) -> None:
+        self.upsert_videos((video,), fetched_at=fetched_at)
+
+    def upsert_videos(self, videos: tuple[Video, ...], *, fetched_at: str) -> None:
+        conn = self._require_conn()
+        with conn:
+            conn.executemany(
+                """
+                INSERT INTO videos (
+                    id, title, channel_id, channel_title, description,
+                    duration_seconds, published_at, privacy, available, fetched_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    title = excluded.title,
+                    channel_id = excluded.channel_id,
+                    channel_title = excluded.channel_title,
+                    description = excluded.description,
+                    duration_seconds = excluded.duration_seconds,
+                    published_at = excluded.published_at,
+                    privacy = excluded.privacy,
+                    available = excluded.available,
+                    fetched_at = excluded.fetched_at
+                """,
+                [
+                    (
+                        video.id,
+                        video.title,
+                        video.channel_id,
+                        video.channel_title,
+                        video.description,
+                        video.duration_seconds,
+                        video.published_at,
+                        video.privacy,
+                        int(video.available),
+                        fetched_at,
+                    )
+                    for video in videos
+                ],
+            )
+
     def _init_schema(self) -> None:
         conn = self._require_conn()
         conn.executescript(
@@ -465,6 +552,18 @@ class LibraryCache:
                 channel_id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
                 subscribed_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS videos (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                channel_title TEXT NOT NULL,
+                description TEXT NOT NULL,
+                duration_seconds INTEGER NOT NULL,
+                published_at TEXT NOT NULL,
+                privacy TEXT NOT NULL,
+                available INTEGER NOT NULL,
+                fetched_at TEXT NOT NULL
             );
             """
         )
