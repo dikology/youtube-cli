@@ -201,33 +201,47 @@ class LibraryCache:
     ) -> None:
         conn = self._require_conn()
         with conn:
-            conn.execute("DELETE FROM playlists")
-            conn.executemany(
-                """
-                INSERT INTO playlists (id, title, item_count, privacy, channel_id, fetched_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    (
-                        playlist.id,
-                        playlist.title,
-                        playlist.item_count,
-                        playlist.privacy,
-                        playlist.channel_id,
-                        fetched_at,
-                    )
-                    for playlist in playlists
-                ],
+            _write_playlists(conn, playlists, fetched_at=fetched_at, truncated=truncated)
+
+    def replace_library(
+        self,
+        *,
+        playlists: tuple[Playlist, ...],
+        items_by_playlist: dict[str, tuple[PlaylistItem, ...]],
+        likes: tuple[LikedVideo, ...],
+        subscriptions: tuple[Subscription, ...],
+        fetched_at: str,
+        playlists_truncated: bool,
+        items_truncated: dict[str, bool],
+        likes_truncated: bool,
+        subscriptions_truncated: bool,
+    ) -> None:
+        conn = self._require_conn()
+        with conn:
+            _write_playlists(
+                conn,
+                playlists,
+                fetched_at=fetched_at,
+                truncated=playlists_truncated,
             )
+            conn.execute("DELETE FROM playlist_items")
             conn.execute(
-                """
-                INSERT INTO collection_meta (name, fetched_at, truncated)
-                VALUES (?, ?, ?)
-                ON CONFLICT(name) DO UPDATE SET
-                    fetched_at = excluded.fetched_at,
-                    truncated = excluded.truncated
-                """,
-                (PLAYLISTS_COLLECTION, fetched_at, int(truncated)),
+                "DELETE FROM collection_meta WHERE name LIKE 'playlist_items:%'"
+            )
+            for playlist_id, items in items_by_playlist.items():
+                _insert_playlist_items(
+                    conn,
+                    playlist_id,
+                    items,
+                    fetched_at=fetched_at,
+                    truncated=items_truncated[playlist_id],
+                )
+            _write_likes(conn, likes, fetched_at=fetched_at, truncated=likes_truncated)
+            _write_subscriptions(
+                conn,
+                subscriptions,
+                fetched_at=fetched_at,
+                truncated=subscriptions_truncated,
             )
 
     def load_playlist_items(self, playlist_id: str) -> CachedPlaylistItems | None:
@@ -277,34 +291,12 @@ class LibraryCache:
                 "DELETE FROM playlist_items WHERE playlist_id = ?",
                 (playlist_id,),
             )
-            conn.executemany(
-                """
-                INSERT INTO playlist_items (
-                    playlist_id, position, video_id, title, channel_title, available
-                )
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    (
-                        item.playlist_id,
-                        item.position,
-                        item.video_id,
-                        item.title,
-                        item.channel_title,
-                        int(item.available),
-                    )
-                    for item in items
-                ],
-            )
-            conn.execute(
-                """
-                INSERT INTO collection_meta (name, fetched_at, truncated)
-                VALUES (?, ?, ?)
-                ON CONFLICT(name) DO UPDATE SET
-                    fetched_at = excluded.fetched_at,
-                    truncated = excluded.truncated
-                """,
-                (_items_collection(playlist_id), fetched_at, int(truncated)),
+            _insert_playlist_items(
+                conn,
+                playlist_id,
+                items,
+                fetched_at=fetched_at,
+                truncated=truncated,
             )
 
     def load_likes(self) -> CachedLikes | None:
@@ -346,33 +338,7 @@ class LibraryCache:
     ) -> None:
         conn = self._require_conn()
         with conn:
-            conn.execute("DELETE FROM likes")
-            conn.executemany(
-                """
-                INSERT INTO likes (position, video_id, title, channel_title, available)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                [
-                    (
-                        item.position,
-                        item.video_id,
-                        item.title,
-                        item.channel_title,
-                        int(item.available),
-                    )
-                    for item in likes
-                ],
-            )
-            conn.execute(
-                """
-                INSERT INTO collection_meta (name, fetched_at, truncated)
-                VALUES (?, ?, ?)
-                ON CONFLICT(name) DO UPDATE SET
-                    fetched_at = excluded.fetched_at,
-                    truncated = excluded.truncated
-                """,
-                (LIKES_COLLECTION, fetched_at, int(truncated)),
-            )
+            _write_likes(conn, likes, fetched_at=fetched_at, truncated=truncated)
 
     def load_subscriptions(self) -> CachedSubscriptions | None:
         conn = self._require_conn()
@@ -411,26 +377,11 @@ class LibraryCache:
     ) -> None:
         conn = self._require_conn()
         with conn:
-            conn.execute("DELETE FROM subscriptions")
-            conn.executemany(
-                """
-                INSERT INTO subscriptions (channel_id, title, subscribed_at)
-                VALUES (?, ?, ?)
-                """,
-                [
-                    (item.channel_id, item.title, item.subscribed_at)
-                    for item in subscriptions
-                ],
-            )
-            conn.execute(
-                """
-                INSERT INTO collection_meta (name, fetched_at, truncated)
-                VALUES (?, ?, ?)
-                ON CONFLICT(name) DO UPDATE SET
-                    fetched_at = excluded.fetched_at,
-                    truncated = excluded.truncated
-                """,
-                (SUBSCRIPTIONS_COLLECTION, fetched_at, int(truncated)),
+            _write_subscriptions(
+                conn,
+                subscriptions,
+                fetched_at=fetched_at,
+                truncated=truncated,
             )
 
     def load_video(self, video_id: str) -> CachedVideo | None:
@@ -582,6 +533,138 @@ class LibraryCache:
         if self._conn is None:
             raise RuntimeError("cache is not open")
         return self._conn
+
+
+def _upsert_collection_meta(
+    conn: sqlite3.Connection, name: str, *, fetched_at: str, truncated: bool
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO collection_meta (name, fetched_at, truncated)
+        VALUES (?, ?, ?)
+        ON CONFLICT(name) DO UPDATE SET
+            fetched_at = excluded.fetched_at,
+            truncated = excluded.truncated
+        """,
+        (name, fetched_at, int(truncated)),
+    )
+
+
+def _write_playlists(
+    conn: sqlite3.Connection,
+    playlists: tuple[Playlist, ...],
+    *,
+    fetched_at: str,
+    truncated: bool,
+) -> None:
+    conn.execute("DELETE FROM playlists")
+    conn.executemany(
+        """
+        INSERT INTO playlists (id, title, item_count, privacy, channel_id, fetched_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                playlist.id,
+                playlist.title,
+                playlist.item_count,
+                playlist.privacy,
+                playlist.channel_id,
+                fetched_at,
+            )
+            for playlist in playlists
+        ],
+    )
+    _upsert_collection_meta(
+        conn, PLAYLISTS_COLLECTION, fetched_at=fetched_at, truncated=truncated
+    )
+
+
+def _insert_playlist_items(
+    conn: sqlite3.Connection,
+    playlist_id: str,
+    items: tuple[PlaylistItem, ...],
+    *,
+    fetched_at: str,
+    truncated: bool,
+) -> None:
+    conn.executemany(
+        """
+        INSERT INTO playlist_items (
+            playlist_id, position, video_id, title, channel_title, available
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                item.playlist_id,
+                item.position,
+                item.video_id,
+                item.title,
+                item.channel_title,
+                int(item.available),
+            )
+            for item in items
+        ],
+    )
+    _upsert_collection_meta(
+        conn,
+        _items_collection(playlist_id),
+        fetched_at=fetched_at,
+        truncated=truncated,
+    )
+
+
+def _write_likes(
+    conn: sqlite3.Connection,
+    likes: tuple[LikedVideo, ...],
+    *,
+    fetched_at: str,
+    truncated: bool,
+) -> None:
+    conn.execute("DELETE FROM likes")
+    conn.executemany(
+        """
+        INSERT INTO likes (position, video_id, title, channel_title, available)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                item.position,
+                item.video_id,
+                item.title,
+                item.channel_title,
+                int(item.available),
+            )
+            for item in likes
+        ],
+    )
+    _upsert_collection_meta(
+        conn, LIKES_COLLECTION, fetched_at=fetched_at, truncated=truncated
+    )
+
+
+def _write_subscriptions(
+    conn: sqlite3.Connection,
+    subscriptions: tuple[Subscription, ...],
+    *,
+    fetched_at: str,
+    truncated: bool,
+) -> None:
+    conn.execute("DELETE FROM subscriptions")
+    conn.executemany(
+        """
+        INSERT INTO subscriptions (channel_id, title, subscribed_at)
+        VALUES (?, ?, ?)
+        """,
+        [
+            (item.channel_id, item.title, item.subscribed_at)
+            for item in subscriptions
+        ],
+    )
+    _upsert_collection_meta(
+        conn, SUBSCRIPTIONS_COLLECTION, fetched_at=fetched_at, truncated=truncated
+    )
 
 
 def _collection_count(conn: sqlite3.Connection, name: str) -> int | None:
