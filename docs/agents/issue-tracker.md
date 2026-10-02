@@ -1,42 +1,45 @@
-# Issue tracker: Linear
+# Issue tracker: GitHub
 
-Issues and specs for this repo live in Linear.
-
-- **Workspace**: [dikology](https://linear.app/dikology)
-- **Team**: Dikology (`DIK`)
-- **Project**: [youtube-cli](https://linear.app/dikology/project/youtube-cli-de7f3d9cf9d4)
-
-Use the Linear MCP (or Linear API) for all operations. Do not use GitHub Issues for this repo.
+Issues and specs for this repo live as GitHub issues. Use the `gh` CLI for all operations.
 
 ## Conventions
 
-- **Create an issue**: `save_issue` with `team: "Dikology"`, `project: "youtube-cli"`, `title`, and `description` (Markdown). New work starts in **Backlog** unless a skill specifies another state.
-- **Read an issue**: `get_issue` with the identifier (e.g. `DIK-123`), including comments when the skill needs discussion.
-- **List issues**: `list_issues` scoped to team Dikology and project youtube-cli, with state/label filters as needed.
-- **Comment**: `save_comment` on the issue.
-- **Apply / remove labels**: update the issue's `labels` via `save_issue`. Label sets replace the full list — include every label that should remain.
-- **Close / cancel**: set state to **Done**, **Canceled**, or **Duplicate** as appropriate.
+- **Create an issue**: `gh issue create --title "..." --body "..."`. Use a heredoc for multi-line bodies.
+- **Read an issue**: `gh issue view <number> --comments`, filtering comments by `jq` and also fetching labels.
+- **List issues**: `gh issue list --state open --json number,title,body,labels,comments --jq '[.[] | {number, title, body, labels: [.labels[].name], comments: [.comments[].body]}]'` with appropriate `--label` and `--state` filters.
+- **Comment on an issue**: `gh issue comment <number> --body "..."`
+- **Apply / remove labels**: `gh issue edit <number> --add-label "..."` / `--remove-label "..."`
+- **Close**: `gh issue close <number> --comment "..."`
 
-Issue identifiers use the `DIK-` prefix.
+Infer the repo from `git remote -v`; `gh` does this automatically when run inside a clone.
 
-## Statuses
+## Pull requests as a triage surface
 
-| State        | Type       | Use                                      |
-| ------------ | ---------- | ---------------------------------------- |
-| Backlog      | backlog    | Captured, not yet scheduled              |
-| Todo         | unstarted  | Ready to start                           |
-| In Progress  | started    | Actively being worked                    |
-| In Review    | started    | Awaiting review                          |
-| Done         | completed  | Finished                                 |
-| Canceled     | canceled   | Will not be done                         |
-| Duplicate    | duplicate  | Same as another issue                    |
+**PRs as a request surface: no.** _(Set to `yes` if this repo treats external PRs as feature requests; `/triage` reads this flag.)_
 
-Type labels already in the team (`Bug`, `Feature`, `Improvement`) are orthogonal to triage labels. Apply both when both apply.
+When set to `yes`, PRs run through the same labels and states as issues, using the `gh pr` equivalents:
+
+- **Read a PR**: `gh pr view <number> --comments` and `gh pr diff <number>` for the diff.
+- **List external PRs for triage**: `gh pr list --state open --json number,title,body,labels,author,authorAssociation,comments` then keep only `authorAssociation` of `CONTRIBUTOR`, `FIRST_TIME_CONTRIBUTOR`, or `NONE` (drop `OWNER`/`MEMBER`/`COLLABORATOR`).
+- **Comment / label / close**: `gh pr comment`, `gh pr edit --add-label`/`--remove-label`, `gh pr close`.
+
+GitHub shares one number space across issues and PRs, so a bare `#42` may be either: resolve with `gh pr view 42` and fall back to `gh issue view 42`.
 
 ## When a skill says "publish to the issue tracker"
 
-Create a Linear issue on team Dikology, project youtube-cli.
+Create a GitHub issue.
 
 ## When a skill says "fetch the relevant ticket"
 
-Load the Linear issue by identifier (`DIK-n`) including comments.
+Run `gh issue view <number> --comments`.
+
+## Wayfinding operations
+
+Used by `/wayfinder`. The **map** is a single issue with **child** issues as tickets.
+
+- **Map**: a single issue labelled `wayfinder:map`, holding the Notes / Decisions-so-far / Fog body. `gh issue create --label wayfinder:map`.
+- **Child ticket**: an issue linked to the map as a GitHub sub-issue (`gh api` on the sub-issues endpoint). Where sub-issues aren't enabled, add the child to a task list in the map body and put `Part of #<map>` at the top of the child body. Labels: `wayfinder:<type>` (`research`/`prototype`/`grilling`/`task`). Once claimed, the ticket is assigned to the driving dev.
+- **Blocking**: GitHub's **native issue dependencies**, the canonical, UI-visible representation. Add an edge with `gh api --method POST repos/<owner>/<repo>/issues/<child>/dependencies/blocked_by -F issue_id=<blocker-db-id>`, where `<blocker-db-id>` is the blocker's numeric **database id** (`gh api repos/<owner>/<repo>/issues/<n> --jq .id`, _not_ the `#number` or `node_id`). GitHub reports `issue_dependencies_summary.blocked_by` (open blockers only, the live gate). Where dependencies aren't available, fall back to a `Blocked by: #<n>, #<n>` line at the top of the child body. A ticket is unblocked when every blocker is closed.
+- **Frontier query**: list the map's open children (`gh issue list --state open`, scoped to the map's sub-issues / task list), drop any with an open blocker (`issue_dependencies_summary.blocked_by > 0`, or an open issue in the `Blocked by` line) or an assignee; first in map order wins.
+- **Claim**: `gh issue edit <n> --add-assignee @me`, the session's first write.
+- **Resolve**: `gh issue comment <n> --body "<answer>"`, then `gh issue close <n>`, then append a context pointer (gist + link) to the map's Decisions-so-far.

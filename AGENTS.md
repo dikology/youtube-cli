@@ -2,7 +2,7 @@
 
 ### Issue tracker
 
-Issues live in Linear (workspace dikology, team Dikology, project youtube-cli). See `docs/agents/issue-tracker.md`.
+Issues live in GitHub Issues on `dikology/youtube-cli` (via the `gh` CLI). See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
