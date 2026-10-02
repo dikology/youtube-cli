@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO
 
-from youtube_cli.cache import CollectionStatus, LibraryCache
+from youtube_cli.cache import CollectionStatus, LibraryCache, SearchHit
 from youtube_cli.credentials import CredentialStore, KeychainCredentialStore, Tokens
 from youtube_cli.oauth import (
     ClientSecretError,
@@ -38,6 +38,7 @@ from youtube_cli.youtube import (
 
 DEFAULT_LIMIT = 500
 MAX_LIMIT = 2000
+SEARCH_TYPES = ("playlist", "video", "channel")
 
 
 class CliError(Exception):
@@ -151,6 +152,14 @@ class SyncCollectionRequest:
     playlist_id: str | None = None
 
 
+@dataclass(frozen=True)
+class SearchRequest:
+    query: str
+    types: frozenset[str]
+    table: bool
+    limit: int
+
+
 Request = (
     AuthLoginRequest
     | AuthLogoutRequest
@@ -164,6 +173,7 @@ Request = (
     | SubsListRequest
     | VideoGetRequest
     | SyncCollectionRequest
+    | SearchRequest
 )
 
 
@@ -219,6 +229,8 @@ def run(
             return _cache_status(request, cache_dir=cache_dir, stdout=out)
         if isinstance(request, CacheClearRequest):
             return _cache_clear(cache_dir=cache_dir, stdout=out)
+        if isinstance(request, SearchRequest):
+            return _search(request, cache_dir=cache_dir, stdout=out)
         tokens = _require_tokens(
             credentials,
             config_dir=config_dir,
@@ -290,6 +302,8 @@ def _parse(argv: list[str]) -> Request:
 
     if args.wipe and not (args.noun == "auth" and args.verb == "logout"):
         raise UsageError("--wipe is only valid with auth logout")
+    if args.type is not None and args.noun != "search":
+        raise UsageError("--type is only valid with search")
     if args.noun == "auth" and args.verb == "status":
         return AuthStatusRequest(table=args.table)
     if args.noun == "auth" and args.verb == "logout":
@@ -304,6 +318,19 @@ def _parse(argv: list[str]) -> Request:
         raise UsageError("--offline and --fresh cannot be combined")
     if args.limit > MAX_LIMIT or args.limit < 1:
         raise UsageError(f"--limit must be between 1 and {MAX_LIMIT}")
+    if args.noun == "search":
+        if not args.verb:
+            raise UsageError("search requires a query")
+        if args.target:
+            raise UsageError("search takes one query; quote multi-word queries")
+        if args.fresh:
+            raise UsageError("search is cache-only and cannot be used with --fresh")
+        return SearchRequest(
+            query=args.verb,
+            types=frozenset(SEARCH_TYPES if args.type is None else (args.type,)),
+            table=args.table,
+            limit=args.limit,
+        )
     if args.noun == "playlists" and args.verb == "list":
         if args.target:
             raise UsageError("playlists list does not take an id")
@@ -399,6 +426,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--wipe", action="store_true")
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
     parser.add_argument("--hydrate", action="store_true")
+    parser.add_argument("--type", choices=SEARCH_TYPES)
 
     def error(message: str) -> None:
         raise UsageError(message)
@@ -641,6 +669,73 @@ def _cache_clear(*, cache_dir: Path | None, stdout: TextIO) -> int:
     )
     stdout.write("\n")
     return 0
+
+
+def _search(
+    request: SearchRequest,
+    *,
+    cache_dir: Path | None,
+    stdout: TextIO,
+) -> int:
+    cache = LibraryCache(_resolve_cache_dir(cache_dir))
+    found = None
+    if cache.db_path.exists():
+        cache.open()
+        try:
+            found = cache.search(request.query, types=request.types)
+        finally:
+            cache.close()
+    if found is None:
+        raise CacheEmptyError("library cache is empty; run a list command or youtube sync")
+    hits = found.hits[: request.limit]
+    if request.table:
+        _write_search_table(stdout, hits)
+        return 0
+    json.dump(
+        {
+            "ok": True,
+            "data": {"hits": [_search_hit_payload(hit) for hit in hits]},
+            "meta": {
+                "from_cache": True,
+                "fetched_at": found.fetched_at,
+                "truncated": found.truncated or len(found.hits) > request.limit,
+                "limit": request.limit,
+            },
+        },
+        stdout,
+    )
+    stdout.write("\n")
+    return 0
+
+
+def _search_hit_payload(hit: SearchHit) -> dict[str, object]:
+    resource = hit.resource
+    if isinstance(resource, Playlist):
+        payload: dict[str, object] = dict(_playlist_payload(resource))
+    elif isinstance(resource, Video):
+        payload = dict(_video_payload(resource))
+    elif isinstance(resource, PlaylistItem):
+        payload = dict(_playlist_item_payload(resource))
+    elif isinstance(resource, LikedVideo):
+        payload = dict(_liked_payload(resource))
+    else:
+        payload = dict(_subscription_payload(resource))
+    return {"type": hit.type, **payload}
+
+
+def _search_hit_id(hit: SearchHit) -> str:
+    resource = hit.resource
+    if isinstance(resource, (Playlist, Video)):
+        return resource.id
+    if isinstance(resource, Subscription):
+        return resource.channel_id
+    return resource.video_id
+
+
+def _write_search_table(out: TextIO, hits: tuple[SearchHit, ...]) -> None:
+    out.write("type\tid\ttitle\n")
+    for hit in hits:
+        out.write(f"{hit.type}\t{_search_hit_id(hit)}\t{hit.resource.title}\n")
 
 
 def _write_cache_status_table(

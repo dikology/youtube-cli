@@ -62,6 +62,22 @@ class CachedVideo:
     fetched_at: str
 
 
+SearchResource = Playlist | Video | PlaylistItem | LikedVideo | Subscription
+
+
+@dataclass(frozen=True)
+class SearchHit:
+    type: str
+    resource: SearchResource
+
+
+@dataclass(frozen=True)
+class CachedSearch:
+    hits: tuple[SearchHit, ...]
+    fetched_at: str
+    truncated: bool
+
+
 class LibraryCache:
     def __init__(self, cache_dir: Path) -> None:
         self.cache_dir = cache_dir
@@ -123,24 +139,8 @@ class LibraryCache:
         ).fetchone()
         if meta is None:
             return None
-        rows = conn.execute(
-            """
-            SELECT id, title, item_count, privacy, channel_id
-            FROM playlists
-            ORDER BY rowid
-            """
-        ).fetchall()
         return CachedPlaylists(
-            playlists=tuple(
-                Playlist(
-                    id=row["id"],
-                    title=row["title"],
-                    item_count=row["item_count"],
-                    privacy=row["privacy"],
-                    channel_id=row["channel_id"],
-                )
-                for row in rows
-            ),
+            playlists=self._all_playlists(),
             fetched_at=meta["fetched_at"],
             truncated=bool(meta["truncated"]),
         )
@@ -307,24 +307,8 @@ class LibraryCache:
         ).fetchone()
         if meta is None:
             return None
-        rows = conn.execute(
-            """
-            SELECT position, video_id, title, channel_title, available
-            FROM likes
-            ORDER BY CASE WHEN position IS NULL THEN 1 ELSE 0 END, position, rowid
-            """
-        ).fetchall()
         return CachedLikes(
-            likes=tuple(
-                LikedVideo(
-                    video_id=row["video_id"],
-                    title=row["title"],
-                    channel_title=row["channel_title"],
-                    available=bool(row["available"]),
-                    position=row["position"],
-                )
-                for row in rows
-            ),
+            likes=self._all_likes(),
             fetched_at=meta["fetched_at"],
             truncated=bool(meta["truncated"]),
         )
@@ -348,22 +332,8 @@ class LibraryCache:
         ).fetchone()
         if meta is None:
             return None
-        rows = conn.execute(
-            """
-            SELECT channel_id, title, subscribed_at
-            FROM subscriptions
-            ORDER BY rowid
-            """
-        ).fetchall()
         return CachedSubscriptions(
-            subscriptions=tuple(
-                Subscription(
-                    channel_id=row["channel_id"],
-                    title=row["title"],
-                    subscribed_at=row["subscribed_at"],
-                )
-                for row in rows
-            ),
+            subscriptions=self._all_subscriptions(),
             fetched_at=meta["fetched_at"],
             truncated=bool(meta["truncated"]),
         )
@@ -465,6 +435,164 @@ class LibraryCache:
                 ],
             )
 
+    def search(self, query: str, *, types: frozenset[str]) -> CachedSearch | None:
+        conn = self._require_conn()
+        oldest = conn.execute(
+            """
+            SELECT MIN(fetched_at) AS fetched_at FROM (
+                SELECT fetched_at FROM collection_meta
+                UNION ALL SELECT fetched_at FROM videos
+                UNION ALL SELECT fetched_at FROM playlists WHERE fetched_at != ''
+            )
+            """
+        ).fetchone()
+        if oldest is None or oldest["fetched_at"] is None:
+            return None
+        needle = query.casefold()
+        hits: list[SearchHit] = []
+        if "playlist" in types:
+            hits.extend(
+                SearchHit(type="playlist", resource=playlist)
+                for playlist in self._all_playlists()
+                if _matches(needle, playlist.title)
+            )
+        if "video" in types:
+            seen: set[str] = set()
+            for video in self._all_videos():
+                seen.add(video.id)
+                if _matches(
+                    needle, video.title, video.channel_title, video.description
+                ):
+                    hits.append(SearchHit(type="video", resource=video))
+            for item in (*self._all_playlist_items(), *self._all_likes()):
+                if not item.video_id or item.video_id in seen:
+                    continue
+                seen.add(item.video_id)
+                if _matches(needle, item.title, item.channel_title):
+                    hits.append(SearchHit(type="video", resource=item))
+        if "channel" in types:
+            hits.extend(
+                SearchHit(type="channel", resource=subscription)
+                for subscription in self._all_subscriptions()
+                if _matches(needle, subscription.title)
+            )
+        return CachedSearch(
+            hits=tuple(hits),
+            fetched_at=oldest["fetched_at"],
+            truncated=self._searched_collections_truncated(types),
+        )
+
+    def _searched_collections_truncated(self, types: frozenset[str]) -> bool:
+        rows = self._require_conn().execute(
+            "SELECT name FROM collection_meta WHERE truncated != 0"
+        ).fetchall()
+        truncated = {
+            "video" if name == LIKES_COLLECTION or name.startswith("playlist_items:")
+            else "channel" if name == SUBSCRIPTIONS_COLLECTION
+            else "playlist"
+            for name in (row["name"] for row in rows)
+        }
+        return bool(truncated & types)
+
+    def _all_playlists(self) -> tuple[Playlist, ...]:
+        rows = self._require_conn().execute(
+            """
+            SELECT id, title, item_count, privacy, channel_id
+            FROM playlists
+            ORDER BY rowid
+            """
+        ).fetchall()
+        return tuple(
+            Playlist(
+                id=row["id"],
+                title=row["title"],
+                item_count=row["item_count"],
+                privacy=row["privacy"],
+                channel_id=row["channel_id"],
+            )
+            for row in rows
+        )
+
+    def _all_videos(self) -> tuple[Video, ...]:
+        rows = self._require_conn().execute(
+            """
+            SELECT id, title, channel_id, channel_title, description,
+                   duration_seconds, published_at, privacy, available
+            FROM videos
+            ORDER BY rowid
+            """
+        ).fetchall()
+        return tuple(
+            Video(
+                id=row["id"],
+                title=row["title"],
+                channel_id=row["channel_id"],
+                channel_title=row["channel_title"],
+                description=row["description"],
+                duration_seconds=row["duration_seconds"],
+                published_at=row["published_at"],
+                privacy=row["privacy"],
+                available=bool(row["available"]),
+            )
+            for row in rows
+        )
+
+    def _all_playlist_items(self) -> tuple[PlaylistItem, ...]:
+        rows = self._require_conn().execute(
+            """
+            SELECT playlist_id, position, video_id, title, channel_title, available
+            FROM playlist_items
+            ORDER BY rowid
+            """
+        ).fetchall()
+        return tuple(
+            PlaylistItem(
+                playlist_id=row["playlist_id"],
+                position=row["position"],
+                video_id=row["video_id"],
+                title=row["title"],
+                channel_title=row["channel_title"],
+                available=bool(row["available"]),
+            )
+            for row in rows
+        )
+
+    def _all_likes(self) -> tuple[LikedVideo, ...]:
+        rows = self._require_conn().execute(
+            """
+            SELECT position, video_id, title, channel_title, available
+            FROM likes
+            ORDER BY CASE WHEN position IS NULL THEN 1 ELSE 0 END, position, rowid
+            """
+        ).fetchall()
+        return tuple(
+            LikedVideo(
+                video_id=row["video_id"],
+                title=row["title"],
+                channel_title=row["channel_title"],
+                available=bool(row["available"]),
+                position=row["position"],
+            )
+            for row in rows
+        )
+
+    def _all_subscriptions(self) -> tuple[Subscription, ...]:
+        rows = self._require_conn().execute(
+            """
+            SELECT channel_id, title, subscribed_at
+            FROM subscriptions
+            ORDER BY rowid
+            """
+        ).fetchall()
+        return tuple(
+            Subscription(
+                channel_id=row["channel_id"],
+                title=row["title"],
+                subscribed_at=row["subscribed_at"],
+            )
+            for row in rows
+        )
+
     def _init_schema(self) -> None:
         conn = self._require_conn()
         conn.executescript(
@@ -533,6 +661,10 @@ class LibraryCache:
         if self._conn is None:
             raise RuntimeError("cache is not open")
         return self._conn
+
+
+def _matches(needle: str, *fields: str) -> bool:
+    return any(needle in field.casefold() for field in fields)
 
 
 def _upsert_collection_meta(
