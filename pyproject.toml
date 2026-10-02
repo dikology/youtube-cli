@@ -11,6 +11,11 @@ dependencies = [
     "keyring>=25.0",
 ]
 
+[project.optional-dependencies]
+transcripts = [
+    "yt-dlp>=2025.9.26",
+]
+
 [project.scripts]
 youtube = "youtube_cli.cli:main"
 

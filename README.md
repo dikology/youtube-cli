@@ -98,3 +98,34 @@ youtube cache clear
 ```
 
 `cache clear` deletes the SQLite file only. `auth logout --wipe` deletes tokens and the cache. Neither removes `client_secret.json`.
+
+## Transcripts
+
+```
+youtube video transcript <id-or-url>
+youtube video transcript <id-or-url> --lang fr
+youtube video transcript <id-or-url> --table
+youtube video transcript <id-or-url> --text
+```
+
+Returns a video's Transcript by taking its Captions from YouTube. It needs no `auth login` and works for any public video, in the library or not. The argument is a bare video ID, a `watch?v=` URL or a `youtu.be/` URL; `youtube video get` accepts the same forms.
+
+This command needs an optional extra, because it uses `yt-dlp` rather than the official API (see `docs/adr/0001-unofficial-download-path-for-transcripts.md`):
+
+```bash
+uv sync --extra transcripts
+```
+
+Without the extra the command exits with `transcripts_extra_missing` and prints that line. No other command depends on it.
+
+- Uploader-written Captions are preferred (`source: captions`); otherwise YouTube's automatic ones are used (`source: auto-captions`). Machine-translated tracks are never used.
+- `--lang <code>` picks the language. Without it, the video's original language is used.
+- The Transcript is stored in the Library Cache, one per video and language. A second call is served from the cache; `--fresh` refetches and `--offline` never fetches. `cache status` reports a `transcripts` count.
+- Output is JSON by default: `data` holds `video_id`, `language`, `source` and `segments`, each Segment with `start`, `end` (seconds) and `text`. `--table` prints one Segment per row with its start time; `--text` prints the text only, one Segment per line. The two cannot be combined.
+- Restricted videos (age-gated, members-only, private) fail with `video_restricted`. Browser cookies are never passed to `yt-dlp`.
+
+| Error code | Exit | Meaning |
+| --- | --- | --- |
+| `no_captions` | 7 | The video has no usable Captions (in the requested language). |
+| `transcripts_extra_missing` | 8 | The `transcripts` extra is not installed. |
+| `video_restricted` | 9 | The video is age-gated, members-only or private. |

@@ -13,6 +13,7 @@ import pytest
 from youtube_cli.cli import run
 from youtube_cli.credentials import CredentialStore, InMemoryCredentialStore, Tokens
 from youtube_cli.oauth import LoginError
+from youtube_cli.transcripts import CaptionSource
 from youtube_cli.youtube import InMemoryYouTubeClient, Playlist, PlaylistItem, YouTubeClient
 
 _MISSING = object()
@@ -111,6 +112,7 @@ def invoke(cache_dir: Path, config_dir: Path) -> Invoke:
         *,
         credentials: CredentialStore | None = None,
         youtube: YouTubeClient | None = None,
+        captions: CaptionSource | None = None,
         cache_dir_override: Path | None | object = _MISSING,
         config_dir_override: Path | None | object = _MISSING,
         open_browser: Callable[[str], object] | None = None,
@@ -128,6 +130,7 @@ def invoke(cache_dir: Path, config_dir: Path) -> Invoke:
             argv,
             credentials=credentials,
             youtube=youtube,
+            captions=captions,
             cache_dir=resolved_cache_dir,  # type: ignore[arg-type]
             config_dir=resolved_config_dir,  # type: ignore[arg-type]
             stdout=stdout,

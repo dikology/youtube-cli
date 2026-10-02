@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from typing import Protocol, cast
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 
@@ -128,6 +129,26 @@ class SubscriptionListResult:
 class VideoListResult:
     videos: tuple[Video, ...]
     quota_cost: int
+
+
+_VIDEO_ID = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def parse_video_id(value: str) -> str | None:
+    """Return the video ID in a bare ID, a watch?v= URL or a youtu.be/ URL."""
+    if "/" not in value:
+        return value if _VIDEO_ID.fullmatch(value) else None
+    parsed = urlparse(value if "://" in value else f"https://{value}")
+    host = (parsed.hostname or "").lower()
+    if host == "youtu.be":
+        video_id = parsed.path.strip("/").split("/")[0]
+    elif host == "youtube.com" or host.endswith(".youtube.com"):
+        if parsed.path.rstrip("/") != "/watch":
+            return None
+        video_id = parse_qs(parsed.query).get("v", [""])[0]
+    else:
+        return None
+    return video_id or None
 
 
 class YouTubeClient(Protocol):

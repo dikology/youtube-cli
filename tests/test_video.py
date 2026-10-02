@@ -547,3 +547,23 @@ def test_playlist_items_offline_hydrate_on_missing_videos_is_offline_miss(
     assert listed.exit_code == 1
     assert listed.json()["error"]["code"] == "offline_miss"
     assert youtube.video_list_calls == []
+
+
+def test_video_get_accepts_watch_and_short_urls(invoke, credentials) -> None:
+    youtube = _video_client(OUTSIDE)
+
+    by_watch = invoke(
+        ["video", "get", "https://www.youtube.com/watch?v=vidOutside1&list=PLabc"],
+        credentials=credentials,
+        youtube=youtube,
+    )
+    by_short = invoke(
+        ["video", "get", "https://youtu.be/vidOutside1", "--fresh"],
+        credentials=credentials,
+        youtube=youtube,
+    )
+
+    assert by_watch.exit_code == 0
+    assert by_watch.json()["data"] == OUTSIDE_PAYLOAD
+    assert by_short.json()["data"] == OUTSIDE_PAYLOAD
+    assert youtube.video_list_calls == [("vidOutside1",), ("vidOutside1",)]

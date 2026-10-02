@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
+from youtube_cli.transcripts import Segment, Source, Transcript, best_language_match
 from youtube_cli.youtube import LikedVideo, Playlist, PlaylistItem, Subscription, Video
 
 PLAYLISTS_COLLECTION = "playlists"
 LIKES_COLLECTION = "likes"
 SUBSCRIPTIONS_COLLECTION = "subscriptions"
+TRANSCRIPTS_COLLECTION = "transcripts"
 
 
 def _items_collection(playlist_id: str) -> str:
@@ -59,6 +63,12 @@ class CachedSubscriptions:
 @dataclass(frozen=True)
 class CachedVideo:
     video: Video
+    fetched_at: str
+
+
+@dataclass(frozen=True)
+class CachedTranscript:
+    transcript: Transcript
     fetched_at: str
 
 
@@ -124,6 +134,17 @@ class LibraryCache:
                         name=name,
                         fetched_at=row["fetched_at"],
                         count=count,
+                    )
+                )
+            transcripts = conn.execute(
+                "SELECT COUNT(*) AS n, MAX(fetched_at) AS fetched_at FROM transcripts"
+            ).fetchone()
+            if transcripts is not None and transcripts["n"]:
+                collections.append(
+                    CollectionStatus(
+                        name=TRANSCRIPTS_COLLECTION,
+                        fetched_at=transcripts["fetched_at"],
+                        count=int(transcripts["n"]),
                     )
                 )
             return tuple(collections)
@@ -435,6 +456,77 @@ class LibraryCache:
                 ],
             )
 
+    def load_transcript(
+        self, video_id: str, *, language: str | None
+    ) -> CachedTranscript | None:
+        """Load one Transcript; without a language, the video's original one."""
+        rows = self._require_conn().execute(
+            """
+            SELECT video_id, language, source, segments, original, fetched_at
+            FROM transcripts
+            WHERE video_id = ?
+            ORDER BY fetched_at DESC
+            """,
+            (video_id,),
+        ).fetchall()
+        if language is None:
+            row = next((row for row in rows if row["original"]), None)
+        else:
+            row = best_language_match(
+                language, rows, language=lambda row: row["language"]
+            )
+        if row is None:
+            return None
+        return CachedTranscript(
+            transcript=Transcript(
+                video_id=row["video_id"],
+                language=row["language"],
+                source=cast(Source, row["source"]),
+                segments=tuple(
+                    Segment(start=start, end=end, text=text)
+                    for start, end, text in json.loads(row["segments"])
+                ),
+            ),
+            fetched_at=row["fetched_at"],
+        )
+
+    def upsert_transcript(
+        self, transcript: Transcript, *, original: bool, fetched_at: str
+    ) -> None:
+        conn = self._require_conn()
+        with conn:
+            if original:
+                conn.execute(
+                    "UPDATE transcripts SET original = 0 WHERE video_id = ?",
+                    (transcript.video_id,),
+                )
+            conn.execute(
+                """
+                INSERT INTO transcripts (
+                    video_id, language, source, segments, original, fetched_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(video_id, language) DO UPDATE SET
+                    source = excluded.source,
+                    segments = excluded.segments,
+                    original = MAX(original, excluded.original),
+                    fetched_at = excluded.fetched_at
+                """,
+                (
+                    transcript.video_id,
+                    transcript.language,
+                    transcript.source,
+                    json.dumps(
+                        [
+                            [segment.start, segment.end, segment.text]
+                            for segment in transcript.segments
+                        ]
+                    ),
+                    int(original),
+                    fetched_at,
+                ),
+            )
+
     def search(self, query: str, *, types: frozenset[str]) -> CachedSearch | None:
         conn = self._require_conn()
         oldest = conn.execute(
@@ -643,6 +735,15 @@ class LibraryCache:
                 privacy TEXT NOT NULL,
                 available INTEGER NOT NULL,
                 fetched_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS transcripts (
+                video_id TEXT NOT NULL,
+                language TEXT NOT NULL,
+                source TEXT NOT NULL,
+                segments TEXT NOT NULL,
+                original INTEGER NOT NULL,
+                fetched_at TEXT NOT NULL,
+                PRIMARY KEY (video_id, language)
             );
             """
         )

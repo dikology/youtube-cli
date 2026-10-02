@@ -21,6 +21,17 @@ from youtube_cli.oauth import (
     login_via_loopback,
     refresh_google_tokens,
 )
+from youtube_cli.transcripts import (
+    CaptionSource,
+    LiveCaptionSource,
+    NoCaptionsError,
+    Transcript,
+    TranscriptError,
+    TranscriptsExtraMissingError,
+    VideoRestrictedError,
+    choose_track,
+    language_matches,
+)
 from youtube_cli.youtube import (
     LiveYouTubeClient,
     NetworkError,
@@ -34,6 +45,7 @@ from youtube_cli.youtube import (
     Video,
     YouTubeApiError,
     YouTubeClient,
+    parse_video_id,
 )
 
 DEFAULT_LIMIT = 500
@@ -146,6 +158,17 @@ class VideoGetRequest:
 
 
 @dataclass(frozen=True)
+class VideoTranscriptRequest:
+    video_id: str
+    language: str | None
+    table: bool
+    text: bool
+    fresh: bool
+    offline: bool
+    limit: int
+
+
+@dataclass(frozen=True)
 class SyncCollectionRequest:
     collection: str
     limit: int
@@ -172,6 +195,7 @@ Request = (
     | LikesListRequest
     | SubsListRequest
     | VideoGetRequest
+    | VideoTranscriptRequest
     | SyncCollectionRequest
     | SearchRequest
 )
@@ -191,6 +215,7 @@ def run(
     *,
     credentials: CredentialStore | None = None,
     youtube: YouTubeClient | None = None,
+    captions: CaptionSource | None = None,
     cache_dir: Path | None = None,
     config_dir: Path | None = None,
     stdout: TextIO | None = None,
@@ -231,6 +256,13 @@ def run(
             return _cache_clear(cache_dir=cache_dir, stdout=out)
         if isinstance(request, SearchRequest):
             return _search(request, cache_dir=cache_dir, stdout=out)
+        if isinstance(request, VideoTranscriptRequest):
+            return _video_transcript(
+                request,
+                captions=captions,
+                cache=_open_cache(cache_dir),
+                stdout=out,
+            )
         tokens = _require_tokens(
             credentials,
             config_dir=config_dir,
@@ -280,7 +312,16 @@ def run(
     except NetworkError as exc:
         _write_error(out, code="network", message=str(exc) or "network failure")
         return 6
-    except YouTubeApiError as exc:
+    except NoCaptionsError as exc:
+        _write_error(out, code="no_captions", message=str(exc))
+        return 7
+    except TranscriptsExtraMissingError as exc:
+        _write_error(out, code="transcripts_extra_missing", message=str(exc))
+        return 8
+    except VideoRestrictedError as exc:
+        _write_error(out, code="video_restricted", message=str(exc))
+        return 9
+    except (YouTubeApiError, TranscriptError) as exc:
         _write_error(out, code="error", message=str(exc))
         return 1
     except (ClientSecretError, LoginError, CliError) as exc:
@@ -304,6 +345,11 @@ def _parse(argv: list[str]) -> Request:
         raise UsageError("--wipe is only valid with auth logout")
     if args.type is not None and args.noun != "search":
         raise UsageError("--type is only valid with search")
+    transcript = args.noun == "video" and args.verb == "transcript"
+    if args.text and not transcript:
+        raise UsageError("--text is only valid with video transcript")
+    if args.lang is not None and not transcript:
+        raise UsageError("--lang is only valid with video transcript")
     if args.noun == "auth" and args.verb == "status":
         return AuthStatusRequest(table=args.table)
     if args.noun == "auth" and args.verb == "logout":
@@ -384,8 +430,22 @@ def _parse(argv: list[str]) -> Request:
         if not args.target:
             raise UsageError("video get requires a video id")
         return VideoGetRequest(
-            video_id=args.target,
+            video_id=_video_id(args.target),
             table=args.table,
+            fresh=args.fresh,
+            offline=args.offline,
+            limit=args.limit,
+        )
+    if transcript:
+        if not args.target:
+            raise UsageError("video transcript requires a video id or url")
+        if args.table and args.text:
+            raise UsageError("--table and --text cannot be combined")
+        return VideoTranscriptRequest(
+            video_id=_video_id(args.target),
+            language=args.lang,
+            table=args.table,
+            text=args.text,
             fresh=args.fresh,
             offline=args.offline,
             limit=args.limit,
@@ -415,6 +475,13 @@ def _parse(argv: list[str]) -> Request:
     raise UsageError(f"unknown command: {' '.join(argv)}")
 
 
+def _video_id(target: str) -> str:
+    video_id = parse_video_id(target)
+    if video_id is None:
+        raise UsageError(f"not a video id or YouTube video url: {target}")
+    return video_id
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="youtube", add_help=False)
     parser.add_argument("noun")
@@ -427,6 +494,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
     parser.add_argument("--hydrate", action="store_true")
     parser.add_argument("--type", choices=SEARCH_TYPES)
+    parser.add_argument("--lang")
+    parser.add_argument("--text", action="store_true")
 
     def error(message: str) -> None:
         raise UsageError(message)
@@ -1158,6 +1227,100 @@ def _video_get(
         },
     )
     return 0
+
+
+def _video_transcript(
+    request: VideoTranscriptRequest,
+    *,
+    captions: CaptionSource | None,
+    cache: LibraryCache,
+    stdout: TextIO,
+) -> int:
+    cached = (
+        None
+        if request.fresh
+        else cache.load_transcript(request.video_id, language=request.language)
+    )
+    if cached is not None:
+        transcript = cached.transcript
+        fetched_at = cached.fetched_at
+    elif request.offline:
+        raise OfflineMissError("transcript is not in the cache; run without --offline")
+    else:
+        source = captions if captions is not None else LiveCaptionSource()
+        fetched_at = _now_iso()
+        listing = source.list_captions(request.video_id)
+        track = choose_track(listing, language=request.language)
+        transcript = Transcript(
+            video_id=request.video_id,
+            language=track.language,
+            source=track.source,
+            segments=source.fetch_segments(request.video_id, track),
+        )
+        cache.upsert_transcript(
+            transcript,
+            original=request.language is None
+            or (
+                listing.original_language is not None
+                and language_matches(listing.original_language, track.language)
+            ),
+            fetched_at=fetched_at,
+        )
+    _emit_transcript(
+        stdout,
+        transcript=transcript,
+        table=request.table,
+        text=request.text,
+        meta={
+            "from_cache": cached is not None,
+            "fetched_at": fetched_at,
+            "truncated": False,
+            "limit": request.limit,
+        },
+    )
+    return 0
+
+
+def _emit_transcript(
+    out: TextIO,
+    *,
+    transcript: Transcript,
+    table: bool,
+    text: bool,
+    meta: dict[str, object],
+) -> None:
+    if table:
+        out.write("start\ttext\n")
+        for segment in transcript.segments:
+            out.write(f"{_timestamp(segment.start)}\t{segment.text}\n")
+        return
+    if text:
+        for segment in transcript.segments:
+            out.write(f"{segment.text}\n")
+        return
+    json.dump(
+        {
+            "ok": True,
+            "data": {
+                "video_id": transcript.video_id,
+                "language": transcript.language,
+                "source": transcript.source,
+                "segments": [
+                    {"start": segment.start, "end": segment.end, "text": segment.text}
+                    for segment in transcript.segments
+                ],
+            },
+            "meta": meta,
+        },
+        out,
+    )
+    out.write("\n")
+
+
+def _timestamp(seconds: float) -> str:
+    minutes, secs = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
 
 
 def _subs_list(
