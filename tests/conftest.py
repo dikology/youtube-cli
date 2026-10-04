@@ -13,7 +13,7 @@ import pytest
 from youtube_cli.cli import run
 from youtube_cli.credentials import CredentialStore, InMemoryCredentialStore, Tokens
 from youtube_cli.oauth import LoginError
-from youtube_cli.transcripts import CaptionSource
+from youtube_cli.transcripts import AudioSource, CaptionSource, SpeechRecognizer
 from youtube_cli.youtube import InMemoryYouTubeClient, Playlist, PlaylistItem, YouTubeClient
 
 _MISSING = object()
@@ -31,6 +31,7 @@ def _reject_refresh(tokens: Tokens) -> Tokens:
 class CliResult:
     exit_code: int
     stdout: str
+    stderr: str = ""
 
     def json(self) -> dict[str, Any]:
         return json.loads(self.stdout)
@@ -113,6 +114,8 @@ def invoke(cache_dir: Path, config_dir: Path) -> Invoke:
         credentials: CredentialStore | None = None,
         youtube: YouTubeClient | None = None,
         captions: CaptionSource | None = None,
+        audio: AudioSource | None = None,
+        recognizer: SpeechRecognizer | None = None,
         cache_dir_override: Path | None | object = _MISSING,
         config_dir_override: Path | None | object = _MISSING,
         open_browser: Callable[[str], object] | None = None,
@@ -120,6 +123,7 @@ def invoke(cache_dir: Path, config_dir: Path) -> Invoke:
         refresh_tokens: Callable[[Tokens], Tokens] | None = None,
     ) -> CliResult:
         stdout = StringIO()
+        stderr = StringIO()
         resolved_cache_dir = (
             cache_dir if cache_dir_override is _MISSING else cache_dir_override
         )
@@ -131,9 +135,12 @@ def invoke(cache_dir: Path, config_dir: Path) -> Invoke:
             credentials=credentials,
             youtube=youtube,
             captions=captions,
+            audio=audio,
+            recognizer=recognizer,
             cache_dir=resolved_cache_dir,  # type: ignore[arg-type]
             config_dir=resolved_config_dir,  # type: ignore[arg-type]
             stdout=stdout,
+            stderr=stderr,
             open_browser=open_browser
             or (_reject_browser),
             exchange_code=exchange_code,
@@ -141,6 +148,10 @@ def invoke(cache_dir: Path, config_dir: Path) -> Invoke:
             if refresh_tokens is not None
             else _reject_refresh,
         )
-        return CliResult(exit_code=exit_code, stdout=stdout.getvalue())
+        return CliResult(
+            exit_code=exit_code,
+            stdout=stdout.getvalue(),
+            stderr=stderr.getvalue(),
+        )
 
     return _invoke

@@ -6,7 +6,7 @@ import os
 import sys
 import webbrowser
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO
@@ -22,14 +22,20 @@ from youtube_cli.oauth import (
     refresh_google_tokens,
 )
 from youtube_cli.transcripts import (
+    DEFAULT_WHISPER_MODEL,
+    AudioSource,
     CaptionSource,
+    LiveAudioSource,
     LiveCaptionSource,
+    LiveSpeechRecognizer,
     NoCaptionsError,
+    SpeechRecognizer,
     Transcript,
     TranscriptError,
     TranscriptsExtraMissingError,
     VideoRestrictedError,
     choose_track,
+    generate_transcript,
     language_matches,
 )
 from youtube_cli.youtube import (
@@ -166,6 +172,7 @@ class VideoTranscriptRequest:
     fresh: bool
     offline: bool
     limit: int
+    generate: bool = False
 
 
 @dataclass(frozen=True)
@@ -216,9 +223,12 @@ def run(
     credentials: CredentialStore | None = None,
     youtube: YouTubeClient | None = None,
     captions: CaptionSource | None = None,
+    audio: AudioSource | None = None,
+    recognizer: SpeechRecognizer | None = None,
     cache_dir: Path | None = None,
     config_dir: Path | None = None,
     stdout: TextIO | None = None,
+    stderr: TextIO | None = None,
     open_browser: Callable[[str], object] | None = None,
     exchange_code: Callable[..., Tokens] | None = None,
     refresh_tokens: Callable[[Tokens], Tokens] | None = None,
@@ -260,8 +270,11 @@ def run(
             return _video_transcript(
                 request,
                 captions=captions,
+                audio=audio,
+                recognizer=recognizer,
                 cache=_open_cache(cache_dir),
                 stdout=out,
+                stderr=stderr or sys.stderr,
             )
         tokens = _require_tokens(
             credentials,
@@ -350,6 +363,8 @@ def _parse(argv: list[str]) -> Request:
         raise UsageError("--text is only valid with video transcript")
     if args.lang is not None and not transcript:
         raise UsageError("--lang is only valid with video transcript")
+    if args.generate and not transcript:
+        raise UsageError("--generate is only valid with video transcript")
     if args.noun == "auth" and args.verb == "status":
         return AuthStatusRequest(table=args.table)
     if args.noun == "auth" and args.verb == "logout":
@@ -449,6 +464,7 @@ def _parse(argv: list[str]) -> Request:
             fresh=args.fresh,
             offline=args.offline,
             limit=args.limit,
+            generate=args.generate,
         )
     if args.noun == "sync" and args.offline:
         raise UsageError("sync cannot be used with --offline")
@@ -496,6 +512,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--type", choices=SEARCH_TYPES)
     parser.add_argument("--lang")
     parser.add_argument("--text", action="store_true")
+    parser.add_argument("--generate", action="store_true")
 
     def error(message: str) -> None:
         raise UsageError(message)
@@ -1233,39 +1250,42 @@ def _video_transcript(
     request: VideoTranscriptRequest,
     *,
     captions: CaptionSource | None,
+    audio: AudioSource | None,
+    recognizer: SpeechRecognizer | None,
     cache: LibraryCache,
     stdout: TextIO,
+    stderr: TextIO,
 ) -> int:
     cached = (
         None
         if request.fresh
         else cache.load_transcript(request.video_id, language=request.language)
     )
+    if request.generate and cached is not None and cached.transcript.source != "generated":
+        cached = None
     if cached is not None:
         transcript = cached.transcript
         fetched_at = cached.fetched_at
     elif request.offline:
         raise OfflineMissError("transcript is not in the cache; run without --offline")
     else:
-        source = captions if captions is not None else LiveCaptionSource()
         fetched_at = _now_iso()
-        listing = source.list_captions(request.video_id)
-        track = choose_track(listing, language=request.language)
-        transcript = Transcript(
-            video_id=request.video_id,
-            language=track.language,
-            source=track.source,
-            segments=source.fetch_segments(request.video_id, track),
+        transcript, spoken = None, None
+        if not request.generate:
+            transcript, spoken = _captions_transcript(request, captions=captions)
+        original = request.language is None or (
+            spoken is not None and language_matches(spoken, request.language)
         )
-        cache.upsert_transcript(
-            transcript,
-            original=request.language is None
-            or (
-                listing.original_language is not None
-                and language_matches(listing.original_language, track.language)
-            ),
-            fetched_at=fetched_at,
-        )
+        if transcript is None:
+            transcript = _generated_transcript(
+                request, audio=audio, recognizer=recognizer, cache=cache, stderr=stderr
+            )
+            # An explicit language of unknown standing never displaces the original.
+            original = original or (
+                spoken is None
+                and cache.load_transcript(request.video_id, language=None) is None
+            )
+        cache.upsert_transcript(transcript, original=original, fetched_at=fetched_at)
     _emit_transcript(
         stdout,
         transcript=transcript,
@@ -1279,6 +1299,63 @@ def _video_transcript(
         },
     )
     return 0
+
+
+def _captions_transcript(
+    request: VideoTranscriptRequest, *, captions: CaptionSource | None
+) -> tuple[Transcript | None, str | None]:
+    """The Transcript taken from Captions, and the video's original language.
+
+    No Transcript means Speech Recognition should produce it instead.
+    """
+    source = captions if captions is not None else LiveCaptionSource()
+    listing = source.list_captions(request.video_id)
+    spoken = listing.original_language
+    try:
+        track = choose_track(listing, language=request.language)
+    except NoCaptionsError:
+        # Speech Recognition only yields the language that is spoken.
+        if (
+            request.language is not None
+            and spoken is not None
+            and not language_matches(spoken, request.language)
+        ):
+            raise
+        return None, spoken
+    return (
+        Transcript(
+            video_id=request.video_id,
+            language=track.language,
+            source=track.source,
+            segments=source.fetch_segments(request.video_id, track),
+        ),
+        spoken,
+    )
+
+
+def _generated_transcript(
+    request: VideoTranscriptRequest,
+    *,
+    audio: AudioSource | None,
+    recognizer: SpeechRecognizer | None,
+    cache: LibraryCache,
+    stderr: TextIO,
+) -> Transcript:
+    transcript = generate_transcript(
+        request.video_id,
+        language=request.language,
+        model=os.environ.get("YOUTUBE_WHISPER_MODEL") or DEFAULT_WHISPER_MODEL,
+        audio=audio if audio is not None else LiveAudioSource(),
+        recognizer=recognizer
+        if recognizer is not None
+        else LiveSpeechRecognizer(stderr),
+        progress=lambda message: print(message, file=stderr, flush=True),
+    )
+    replaced = cache.load_transcript(request.video_id, language=transcript.language)
+    if replaced is None:
+        return transcript
+    # One Transcript per language: take the place of the cached one.
+    return replace(transcript, language=replaced.transcript.language)
 
 
 def _emit_transcript(

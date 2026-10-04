@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import importlib
 import json
-from collections.abc import Callable, Iterable
-from dataclasses import dataclass
-from typing import Any, Literal, Protocol, cast
+import platform
+import sys
+import tempfile
+from collections.abc import Callable, Generator, Iterable
+from contextlib import contextmanager, redirect_stdout
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Literal, Protocol, TextIO, cast
 from urllib.parse import parse_qs, urlparse
 
 from youtube_cli.youtube import NetworkError, NotFoundError
@@ -17,6 +22,9 @@ _CAPTION_FORMAT = "json3"
 # yt-dlp's language_preference for the original audio track; its "default"
 # track ranks lower and may be a dub picked for the viewer's locale.
 _ORIGINAL_AUDIO = 10
+DEFAULT_WHISPER_MODEL = "mlx-community/whisper-large-v3-mlx"
+# Biases Speech Recognition towards Simplified script with punctuation.
+CHINESE_PROMPT = "以下是普通话的句子，使用简体中文，并加上标点符号。"
 
 
 @dataclass(frozen=True)
@@ -53,6 +61,18 @@ class CaptionSource(Protocol):
 
     def fetch_segments(
         self, video_id: str, track: CaptionTrack
+    ) -> tuple[Segment, ...]: ...
+
+
+class AudioSource(Protocol):
+    def download(self, video_id: str, directory: Path) -> Path: ...
+
+
+class SpeechRecognizer(Protocol):
+    def detect_language(self, audio: Path, *, model: str) -> str: ...
+
+    def recognize(
+        self, audio: Path, *, model: str, language: str, prompt: str | None
     ) -> tuple[Segment, ...]: ...
 
 
@@ -117,6 +137,43 @@ def choose_track(captions: VideoCaptions, *, language: str | None) -> CaptionTra
     )
 
 
+def generate_transcript(
+    video_id: str,
+    *,
+    language: str | None,
+    model: str,
+    audio: AudioSource,
+    recognizer: SpeechRecognizer,
+    progress: Callable[[str], None],
+) -> Transcript:
+    """Speech Recognition over the video's audio, which is deleted afterwards."""
+    with tempfile.TemporaryDirectory(prefix="youtube-cli-") as directory:
+        progress(f"downloading audio for {video_id}")
+        path = audio.download(video_id, Path(directory))
+        spoken = (
+            _engine_language(language)
+            if language is not None
+            else recognizer.detect_language(path, model=model)
+        )
+        progress(f"recognizing speech ({spoken}) with {model}")
+        segments = recognizer.recognize(
+            path,
+            model=model,
+            language=spoken,
+            prompt=CHINESE_PROMPT if spoken == "zh" else None,
+        )
+    return Transcript(
+        video_id=video_id,
+        language=language or spoken,
+        source="generated",
+        segments=segments,
+    )
+
+
+def _engine_language(language: str) -> str:
+    return language.split("-")[0].lower()
+
+
 @dataclass(frozen=True)
 class FakeTrack:
     language: str
@@ -172,6 +229,52 @@ class InMemoryCaptionSource:
         return self.videos[video_id].tracks[int(track.ref)].segments
 
 
+class InMemoryAudioSource:
+    def __init__(self, *, network_error: bool = False) -> None:
+        self.network_error = network_error
+        self.downloads: list[str] = []
+        self.paths: list[Path] = []
+
+    def download(self, video_id: str, directory: Path) -> Path:
+        self.downloads.append(video_id)
+        path = directory / f"{video_id}.m4a"
+        path.write_bytes(b"audio")
+        self.paths.append(path)
+        if self.network_error:
+            raise NetworkError("network failure")
+        return path
+
+
+@dataclass(frozen=True)
+class RecognitionCall:
+    model: str
+    language: str
+    prompt: str | None
+
+
+@dataclass
+class InMemorySpeechRecognizer:
+    language: str = "en"
+    segments: tuple[Segment, ...] = ()
+    fails: bool = False
+    detections: int = 0
+    runs: list[RecognitionCall] = field(default_factory=list[RecognitionCall])
+
+    def detect_language(self, audio: Path, *, model: str) -> str:
+        self.detections += 1
+        return self.language
+
+    def recognize(
+        self, audio: Path, *, model: str, language: str, prompt: str | None
+    ) -> tuple[Segment, ...]:
+        if not audio.exists():
+            raise AssertionError(f"audio is missing: {audio}")
+        self.runs.append(RecognitionCall(model=model, language=language, prompt=prompt))
+        if self.fails:
+            raise TranscriptError("Speech Recognition failed")
+        return self.segments
+
+
 _RESTRICTED_MARKERS = (
     "private video",
     "members-only",
@@ -204,25 +307,48 @@ class _SilentLogger:
         pass
 
 
+def _import_extra(module: str) -> Any:
+    try:
+        return importlib.import_module(module)
+    except ImportError as exc:
+        raise TranscriptsExtraMissingError(
+            f"transcripts need the optional extra; run: {INSTALL_HINT}"
+        ) from exc
+
+
+def _with_yt_dlp(
+    yt_dlp: Any, video_id: str, options: dict[str, object], action: Callable[[Any], Any]
+) -> Any:
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "logger": _SilentLogger(),
+        "noplaylist": True,
+        **options,
+    }
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            return action(ydl)
+    except Exception as exc:
+        raise _translate_error(video_id, exc) from exc
+
+
+def _watch_url(video_id: str) -> str:
+    return f"https://www.youtube.com/watch?v={video_id}"
+
+
 class LiveCaptionSource:
     """Captions via yt-dlp. Never passes browser cookies (see ADR 0001)."""
 
     def __init__(self) -> None:
-        try:
-            self._yt_dlp: Any = importlib.import_module("yt_dlp")
-        except ImportError as exc:
-            raise TranscriptsExtraMissingError(
-                f"transcripts need the optional extra; run: {INSTALL_HINT}"
-            ) from exc
+        self._yt_dlp = _import_extra("yt_dlp")
 
     def list_captions(self, video_id: str) -> VideoCaptions:
         info = _object_map(
             self._call(
                 video_id,
                 lambda ydl: ydl.extract_info(
-                    f"https://www.youtube.com/watch?v={video_id}",
-                    download=False,
-                    process=False,
+                    _watch_url(video_id), download=False, process=False
                 ),
             )
         )
@@ -244,18 +370,95 @@ class LiveCaptionSource:
         return segments_from_json3(payload)
 
     def _call(self, video_id: str, action: Callable[[Any], Any]) -> Any:
-        options = {
-            "quiet": True,
-            "no_warnings": True,
-            "logger": _SilentLogger(),
-            "skip_download": True,
-            "noplaylist": True,
+        return _with_yt_dlp(self._yt_dlp, video_id, {"skip_download": True}, action)
+
+
+class LiveAudioSource:
+    """A video's audio via yt-dlp. Never passes browser cookies (see ADR 0001)."""
+
+    def __init__(self) -> None:
+        self._yt_dlp = _import_extra("yt_dlp")
+
+    def download(self, video_id: str, directory: Path) -> Path:
+        def fetch(ydl: Any) -> str:
+            info = ydl.extract_info(_watch_url(video_id), download=True)
+            return ydl.prepare_filename(info)
+
+        options: dict[str, object] = {
+            "format": "bestaudio/best",
+            "outtmpl": str(directory / "%(id)s.%(ext)s"),
         }
+        return Path(_with_yt_dlp(self._yt_dlp, video_id, options, fetch))
+
+
+class LiveSpeechRecognizer:
+    """Speech Recognition via mlx-whisper; everything it prints goes to stderr."""
+
+    def __init__(self, stderr: TextIO) -> None:
         try:
-            with self._yt_dlp.YoutubeDL(options) as ydl:
-                return action(ydl)
+            self._whisper = _import_extra("mlx_whisper")
+        except TranscriptsExtraMissingError:
+            if (sys.platform, platform.machine()) != ("darwin", "arm64"):
+                raise TranscriptError(
+                    "Speech Recognition needs an Apple Silicon Mac"
+                ) from None
+            raise
+        self._stderr = stderr
+
+    def detect_language(self, audio: Path, *, model: str) -> str:
+        whisper: Any = importlib.import_module("mlx_whisper.transcribe")
+        with self._engine(model):
+            loaded = whisper.ModelHolder.get_model(model, whisper.mx.float16)
+            if not loaded.is_multilingual:
+                return "en"
+            mel = whisper.log_mel_spectrogram(
+                str(audio), n_mels=loaded.dims.n_mels, padding=whisper.N_SAMPLES
+            )
+            window = whisper.pad_or_trim(mel, whisper.N_FRAMES, axis=-2)
+            _, probabilities = loaded.detect_language(window.astype(whisper.mx.float16))
+        return str(max(probabilities, key=probabilities.get))
+
+    def recognize(
+        self, audio: Path, *, model: str, language: str, prompt: str | None
+    ) -> tuple[Segment, ...]:
+        with self._engine(model):
+            result = self._whisper.transcribe(
+                str(audio),
+                path_or_hf_repo=model,
+                language=language,
+                initial_prompt=prompt,
+                verbose=False,
+            )
+        return segments_from_whisper(result)
+
+    @contextmanager
+    def _engine(self, model: str) -> Generator[None]:
+        if not Path(model).exists() and not self._downloaded(model):
+            print(
+                f"downloading Speech Recognition model {model} (first use only)",
+                file=self._stderr,
+                flush=True,
+            )
+        try:
+            with redirect_stdout(self._stderr):
+                yield
         except Exception as exc:
-            raise _translate_error(video_id, exc) from exc
+            raise TranscriptError(f"Speech Recognition failed: {exc}") from exc
+
+    def _downloaded(self, model: str) -> bool:
+        try:
+            hub: Any = importlib.import_module("huggingface_hub")
+            return isinstance(hub.try_to_load_from_cache(model, "config.json"), str)
+        except Exception:
+            return False
+
+
+def segments_from_whisper(result: object) -> tuple[Segment, ...]:
+    return tuple(
+        Segment(start=_as_float(entry.get("start")), end=_as_float(entry.get("end")), text=text)
+        for entry in map(_object_map, _object_list(_object_map(result).get("segments")))
+        if (text := _as_str(entry.get("text")).strip())
+    )
 
 
 def _translate_error(video_id: str, exc: Exception) -> Exception:
@@ -373,3 +576,9 @@ def _as_int(value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return 0
     return int(value)
+
+
+def _as_float(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    return float(value)

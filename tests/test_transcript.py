@@ -1,11 +1,18 @@
 import sys
 import types
+from io import StringIO
+from pathlib import Path
 
 from youtube_cli.transcripts import (
     FakeTrack,
     FakeVideo,
+    InMemoryAudioSource,
     InMemoryCaptionSource,
+    InMemorySpeechRecognizer,
+    LiveAudioSource,
     LiveCaptionSource,
+    LiveSpeechRecognizer,
+    RecognitionCall,
     Segment,
     Source,
     choose_track,
@@ -21,6 +28,14 @@ HELLO_PAYLOAD = [
 ]
 AUTO = (Segment(start=0.0, end=1.0, text="hello there"),)
 FRENCH = (Segment(start=0.0, end=2.5, text="Bonjour."),)
+MANDARIN = (
+    Segment(start=0.0, end=3.0, text="大家好，欢迎回来。"),
+    Segment(start=3.0, end=6.5, text="今天我们聊聊天气。"),
+)
+MANDARIN_PAYLOAD = [
+    {"start": 0.0, "end": 3.0, "text": "大家好，欢迎回来。"},
+    {"start": 3.0, "end": 6.5, "text": "今天我们聊聊天气。"},
+]
 LONG = (
     Segment(start=5.0, end=7.0, text="Early on."),
     Segment(start=3725.4, end=3730.0, text="Much later."),
@@ -177,14 +192,368 @@ def test_translated_tracks_are_never_used(invoke) -> None:
     assert result.json()["error"]["code"] == "no_captions"
 
 
-def test_video_without_captions_fails_with_its_own_error_code(invoke) -> None:
-    result = invoke(["video", "transcript", "vidTalk1"], captions=_source())
+def test_video_without_captions_gets_a_generated_transcript(invoke) -> None:
+    audio = InMemoryAudioSource()
+    recognizer = InMemorySpeechRecognizer(language="zh", segments=MANDARIN)
+
+    result = invoke(
+        ["video", "transcript", "vidTalk1"],
+        captions=_source(original_language="zh"),
+        audio=audio,
+        recognizer=recognizer,
+    )
+
+    assert result.exit_code == 0
+    body = result.json()
+    assert body["data"] == {
+        "video_id": "vidTalk1",
+        "language": "zh",
+        "source": "generated",
+        "segments": MANDARIN_PAYLOAD,
+    }
+    assert body["meta"]["from_cache"] is False
+    assert audio.downloads == ["vidTalk1"]
+
+
+def test_original_language_without_captions_is_generated_despite_other_tracks(
+    invoke,
+) -> None:
+    recognizer = InMemorySpeechRecognizer(language="zh", segments=MANDARIN)
+
+    result = invoke(
+        ["video", "transcript", "vidTalk1"],
+        captions=_source(_track("en", "captions"), original_language="zh"),
+        audio=InMemoryAudioSource(),
+        recognizer=recognizer,
+    )
+
+    assert result.exit_code == 0
+    assert result.json()["data"]["source"] == "generated"
+    assert result.json()["data"]["language"] == "zh"
+
+
+def test_lang_other_than_the_spoken_one_is_not_generated(invoke) -> None:
+    audio = InMemoryAudioSource()
+
+    result = invoke(
+        ["video", "transcript", "vidTalk1", "--lang", "fr"],
+        captions=_source(_track("en", "captions")),
+        audio=audio,
+        recognizer=InMemorySpeechRecognizer(),
+    )
 
     assert result.exit_code == 7
-    body = result.json()
-    assert body["ok"] is False
-    assert body["error"]["code"] == "no_captions"
-    assert body["error"]["message"]
+    assert result.json()["error"]["code"] == "no_captions"
+    assert audio.downloads == []
+
+
+def test_generate_bypasses_existing_captions(invoke) -> None:
+    captions = _source(_track())
+    recognizer = InMemorySpeechRecognizer(language="en", segments=AUTO)
+
+    result = invoke(
+        ["video", "transcript", "vidTalk1", "--generate"],
+        captions=captions,
+        audio=InMemoryAudioSource(),
+        recognizer=recognizer,
+    )
+
+    assert result.exit_code == 0
+    assert result.json()["data"]["source"] == "generated"
+    assert captions.list_calls == []
+
+
+def test_generate_replaces_a_cached_transcript_from_another_source(invoke) -> None:
+    captions = _source(_track())
+    invoke(["video", "transcript", "vidTalk1"], captions=captions)
+    recognizer = InMemorySpeechRecognizer(language="en", segments=AUTO)
+
+    generated = invoke(
+        ["video", "transcript", "vidTalk1", "--generate"],
+        audio=InMemoryAudioSource(),
+        recognizer=recognizer,
+    )
+    captions.network_error = True
+    after = invoke(["video", "transcript", "vidTalk1"], captions=captions)
+
+    assert generated.json()["meta"]["from_cache"] is False
+    assert generated.json()["data"]["source"] == "generated"
+    assert after.json()["meta"]["from_cache"] is True
+    assert after.json()["data"]["source"] == "generated"
+    assert invoke(["cache", "status"]).json()["data"]["collections"]["transcripts"][
+        "count"
+    ] == 1
+
+
+def test_generate_serves_an_already_generated_transcript_from_the_cache(
+    invoke,
+) -> None:
+    audio = InMemoryAudioSource()
+    recognizer = InMemorySpeechRecognizer(language="zh", segments=MANDARIN)
+    argv = ["video", "transcript", "vidTalk1", "--generate"]
+    invoke(argv, audio=audio, recognizer=recognizer)
+
+    again = invoke(argv, audio=audio, recognizer=recognizer)
+
+    assert again.exit_code == 0
+    assert again.json()["meta"]["from_cache"] is True
+    assert again.json()["data"]["segments"] == MANDARIN_PAYLOAD
+    assert audio.downloads == ["vidTalk1"]
+    assert len(recognizer.runs) == 1
+
+
+def test_generate_with_fresh_reruns_speech_recognition(invoke) -> None:
+    audio = InMemoryAudioSource()
+    recognizer = InMemorySpeechRecognizer(language="zh", segments=MANDARIN)
+    argv = ["video", "transcript", "vidTalk1", "--generate"]
+    invoke(argv, audio=audio, recognizer=recognizer)
+
+    again = invoke([*argv, "--fresh"], audio=audio, recognizer=recognizer)
+
+    assert again.json()["meta"]["from_cache"] is False
+    assert audio.downloads == ["vidTalk1", "vidTalk1"]
+    assert len(recognizer.runs) == 2
+
+
+def test_offline_miss_does_not_download_or_generate(invoke) -> None:
+    captions = _source(_track())
+    invoke(["video", "transcript", "vidTalk1"], captions=captions)
+    audio = InMemoryAudioSource()
+    recognizer = InMemorySpeechRecognizer()
+
+    for argv in (
+        ["video", "transcript", "vidOther1", "--offline"],
+        ["video", "transcript", "vidTalk1", "--generate", "--offline"],
+    ):
+        result = invoke(argv, captions=captions, audio=audio, recognizer=recognizer)
+
+        assert result.exit_code == 1
+        assert result.json()["error"]["code"] == "offline_miss"
+    assert captions.list_calls == ["vidTalk1"]
+    assert audio.downloads == []
+    assert recognizer.runs == []
+
+
+def test_generate_is_rejected_on_other_commands(invoke) -> None:
+    result = invoke(["video", "get", "vidTalk1", "--generate"])
+
+    assert result.exit_code == 2
+    assert result.json()["error"]["code"] == "usage"
+
+
+def test_generated_transcript_replaces_captions_in_a_variant_of_its_language(
+    invoke,
+) -> None:
+    invoke(
+        ["video", "transcript", "vidTalk1"],
+        captions=_source(_track("zh-Hans"), original_language="zh-Hans"),
+    )
+
+    generated = invoke(
+        ["video", "transcript", "vidTalk1", "--generate"],
+        audio=InMemoryAudioSource(),
+        recognizer=InMemorySpeechRecognizer(language="zh", segments=MANDARIN),
+    )
+
+    assert generated.json()["data"]["source"] == "generated"
+    assert generated.json()["data"]["language"] == "zh-Hans"
+    assert invoke(["cache", "status"]).json()["data"]["collections"]["transcripts"][
+        "count"
+    ] == 1
+
+
+def test_generating_without_lang_replaces_a_variant_that_is_not_the_original(
+    invoke,
+) -> None:
+    captions = _source(_track("en"), _track("zh-Hans"), original_language="en")
+    invoke(["video", "transcript", "vidTalk1", "--lang", "zh-Hans"], captions=captions)
+
+    invoke(
+        ["video", "transcript", "vidTalk1", "--generate"],
+        audio=InMemoryAudioSource(),
+        recognizer=InMemorySpeechRecognizer(language="zh", segments=MANDARIN),
+    )
+
+    assert invoke(["cache", "status"]).json()["data"]["collections"]["transcripts"][
+        "count"
+    ] == 1
+
+
+def test_generating_in_a_named_language_keeps_the_original_transcript(invoke) -> None:
+    captions = _source(_track())
+    invoke(["video", "transcript", "vidTalk1"], captions=captions)
+
+    invoke(
+        ["video", "transcript", "vidTalk1", "--generate", "--lang", "fr"],
+        audio=InMemoryAudioSource(),
+        recognizer=InMemorySpeechRecognizer(segments=FRENCH),
+    )
+    captions.network_error = True
+    default = invoke(["video", "transcript", "vidTalk1"], captions=captions)
+
+    assert default.json()["data"]["language"] == "en"
+    assert default.json()["data"]["source"] == "captions"
+
+
+def test_generating_in_a_named_language_serves_later_calls_without_lang(
+    invoke,
+) -> None:
+    audio = InMemoryAudioSource()
+    recognizer = InMemorySpeechRecognizer(segments=MANDARIN)
+    invoke(
+        ["video", "transcript", "vidTalk1", "--generate", "--lang", "zh"],
+        audio=audio,
+        recognizer=recognizer,
+    )
+
+    default = invoke(["video", "transcript", "vidTalk1"], audio=audio)
+
+    assert default.json()["meta"]["from_cache"] is True
+    assert default.json()["data"]["language"] == "zh"
+    assert audio.downloads == ["vidTalk1"]
+
+
+def test_speech_recognition_uses_large_v3_unless_the_environment_names_a_model(
+    invoke, monkeypatch
+) -> None:
+    recognizer = InMemorySpeechRecognizer(segments=AUTO)
+    argv = ["video", "transcript", "vidTalk1", "--generate", "--fresh"]
+    monkeypatch.delenv("YOUTUBE_WHISPER_MODEL", raising=False)
+    invoke(argv, audio=InMemoryAudioSource(), recognizer=recognizer)
+    monkeypatch.setenv("YOUTUBE_WHISPER_MODEL", "mlx-community/whisper-tiny")
+
+    invoke(argv, audio=InMemoryAudioSource(), recognizer=recognizer)
+
+    assert [run.model for run in recognizer.runs] == [
+        "mlx-community/whisper-large-v3-mlx",
+        "mlx-community/whisper-tiny",
+    ]
+
+
+def test_lang_is_passed_to_the_engine_instead_of_detecting(invoke) -> None:
+    recognizer = InMemorySpeechRecognizer(language="en", segments=FRENCH)
+
+    result = invoke(
+        ["video", "transcript", "vidTalk1", "--generate", "--lang", "fr-CA"],
+        audio=InMemoryAudioSource(),
+        recognizer=recognizer,
+    )
+
+    assert result.json()["data"]["language"] == "fr-CA"
+    assert recognizer.detections == 0
+    assert [run.language for run in recognizer.runs] == ["fr"]
+
+
+def test_chinese_runs_are_prompted_for_punctuated_simplified_script(invoke) -> None:
+    detected = InMemorySpeechRecognizer(language="zh", segments=MANDARIN)
+    requested = InMemorySpeechRecognizer(language="en", segments=MANDARIN)
+
+    invoke(
+        ["video", "transcript", "vidTalk1", "--generate"],
+        audio=InMemoryAudioSource(),
+        recognizer=detected,
+    )
+    invoke(
+        ["video", "transcript", "vidTalk2", "--generate", "--lang", "zh-TW"],
+        audio=InMemoryAudioSource(),
+        recognizer=requested,
+    )
+
+    for recognizer in (detected, requested):
+        (run,) = recognizer.runs
+        assert run.language == "zh"
+        assert run.prompt is not None
+        assert "简体中文" in run.prompt
+        assert "，" in run.prompt and "。" in run.prompt
+
+
+def test_other_languages_get_no_prompt(invoke) -> None:
+    recognizer = InMemorySpeechRecognizer(language="en", segments=AUTO)
+
+    invoke(
+        ["video", "transcript", "vidTalk1", "--generate"],
+        audio=InMemoryAudioSource(),
+        recognizer=recognizer,
+    )
+
+    assert recognizer.runs == [
+        RecognitionCall(
+            model="mlx-community/whisper-large-v3-mlx", language="en", prompt=None
+        )
+    ]
+
+
+def test_no_audio_is_left_behind_after_success(invoke) -> None:
+    audio = InMemoryAudioSource()
+
+    result = invoke(
+        ["video", "transcript", "vidTalk1", "--generate"],
+        audio=audio,
+        recognizer=InMemorySpeechRecognizer(segments=AUTO),
+    )
+
+    assert result.exit_code == 0
+    (path,) = audio.paths
+    assert not path.exists()
+    assert not path.parent.exists()
+
+
+def test_no_audio_is_left_behind_after_failure(invoke) -> None:
+    audio = InMemoryAudioSource()
+
+    result = invoke(
+        ["video", "transcript", "vidTalk1", "--generate"],
+        audio=audio,
+        recognizer=InMemorySpeechRecognizer(fails=True),
+    )
+
+    assert result.exit_code == 1
+    assert result.json()["error"]["code"] == "error"
+    (path,) = audio.paths
+    assert not path.parent.exists()
+    assert invoke(["video", "transcript", "vidTalk1", "--offline"]).exit_code == 1
+
+
+def test_no_audio_is_left_behind_when_the_download_fails(invoke) -> None:
+    audio = InMemoryAudioSource(network_error=True)
+    recognizer = InMemorySpeechRecognizer()
+
+    result = invoke(
+        ["video", "transcript", "vidTalk1", "--generate"],
+        audio=audio,
+        recognizer=recognizer,
+    )
+
+    assert result.exit_code == 6
+    (path,) = audio.paths
+    assert not path.parent.exists()
+    assert recognizer.runs == []
+
+
+def test_progress_goes_to_stderr_and_stdout_holds_only_the_result(invoke) -> None:
+    result = invoke(
+        ["video", "transcript", "vidTalk1", "--generate", "--text"],
+        audio=InMemoryAudioSource(),
+        recognizer=InMemorySpeechRecognizer(language="zh", segments=MANDARIN),
+    )
+
+    assert result.stdout == "大家好，欢迎回来。\n今天我们聊聊天气。\n"
+    assert "audio" in result.stderr
+    assert "recognizing speech" in result.stderr
+
+
+def test_missing_recognition_engine_prints_the_install_line_before_downloading(
+    invoke, monkeypatch
+) -> None:
+    monkeypatch.setitem(sys.modules, "mlx_whisper", None)
+    audio = InMemoryAudioSource()
+
+    result = invoke(["video", "transcript", "vidTalk1", "--generate"], audio=audio)
+
+    assert result.exit_code == 8
+    assert result.json()["error"]["code"] == "transcripts_extra_missing"
+    assert "uv sync --extra transcripts" in result.json()["error"]["message"]
+    assert audio.downloads == []
 
 
 def test_restricted_video_fails_with_a_clear_error(invoke) -> None:
@@ -470,3 +839,85 @@ def test_original_language_is_the_only_audio_language_when_nothing_else_says(
     )
 
     assert source.list_captions("vidTalk1").original_language == "fr"
+
+
+def _live_recognizer(
+    monkeypatch, *, cached_model: bool, stderr: StringIO
+) -> tuple[LiveSpeechRecognizer, list[dict[str, object]]]:
+    calls: list[dict[str, object]] = []
+
+    def transcribe(audio: str, **options: object) -> dict[str, object]:
+        calls.append({"audio": audio, **options})
+        print("engine chatter")
+        return {
+            "segments": [
+                {"start": 0, "end": 3.0, "text": " 大家好，欢迎回来。"},
+                {"start": 3.0, "end": 4.0, "text": "  "},
+            ]
+        }
+
+    hub = types.SimpleNamespace(
+        try_to_load_from_cache=lambda repo, filename: "/models/config.json"
+        if cached_model
+        else None
+    )
+    monkeypatch.setitem(
+        sys.modules, "mlx_whisper", types.SimpleNamespace(transcribe=transcribe)
+    )
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+    return LiveSpeechRecognizer(stderr), calls
+
+
+def test_live_recognition_keeps_engine_output_off_stdout(
+    monkeypatch, capsys, tmp_path: Path
+) -> None:
+    stderr = StringIO()
+    recognizer, calls = _live_recognizer(monkeypatch, cached_model=True, stderr=stderr)
+
+    segments = recognizer.recognize(
+        tmp_path / "vidTalk1.m4a", model="some/model", language="zh", prompt="提示。"
+    )
+
+    assert segments == (Segment(start=0.0, end=3.0, text="大家好，欢迎回来。"),)
+    assert capsys.readouterr().out == ""
+    assert stderr.getvalue() == "engine chatter\n"
+    assert calls[0]["path_or_hf_repo"] == "some/model"
+    assert calls[0]["language"] == "zh"
+    assert calls[0]["initial_prompt"] == "提示。"
+
+
+def test_first_use_of_a_model_announces_its_download_on_stderr(
+    monkeypatch, capsys, tmp_path: Path
+) -> None:
+    stderr = StringIO()
+    recognizer, _ = _live_recognizer(monkeypatch, cached_model=False, stderr=stderr)
+
+    recognizer.recognize(
+        tmp_path / "vidTalk1.m4a", model="some/model", language="en", prompt=None
+    )
+
+    assert "downloading Speech Recognition model some/model" in stderr.getvalue()
+    assert capsys.readouterr().out == ""
+
+
+def test_live_audio_is_downloaded_into_the_given_directory(
+    monkeypatch, tmp_path: Path
+) -> None:
+    seen: dict[str, object] = {}
+
+    class _Downloader(_FakeYoutubeDL):
+        def prepare_filename(self, info: dict[str, object]) -> str:
+            return str(seen["outtmpl"]).replace("%(id)s.%(ext)s", "vidTalk1.webm")
+
+    def youtube_dl(options: dict[str, object]) -> _Downloader:
+        seen.update(options)
+        return _Downloader({"id": "vidTalk1"})
+
+    monkeypatch.setitem(
+        sys.modules, "yt_dlp", types.SimpleNamespace(YoutubeDL=youtube_dl)
+    )
+
+    path = LiveAudioSource().download("vidTalk1", tmp_path)
+
+    assert path == tmp_path / "vidTalk1.webm"
+    assert "cookiefile" not in seen and "cookiesfrombrowser" not in seen

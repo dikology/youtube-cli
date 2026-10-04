@@ -106,11 +106,12 @@ youtube video transcript <id-or-url>
 youtube video transcript <id-or-url> --lang fr
 youtube video transcript <id-or-url> --table
 youtube video transcript <id-or-url> --text
+youtube video transcript <id-or-url> --generate
 ```
 
-Returns a video's Transcript by taking its Captions from YouTube. It needs no `auth login` and works for any public video, in the library or not. The argument is a bare video ID, a `watch?v=` URL or a `youtu.be/` URL; `youtube video get` accepts the same forms.
+Returns a video's Transcript by taking its Captions from YouTube, or by running Speech Recognition on this machine when it has none. It needs no `auth login` and works for any public video, in the library or not. The argument is a bare video ID, a `watch?v=` URL or a `youtu.be/` URL; `youtube video get` accepts the same forms.
 
-This command needs an optional extra, because it uses `yt-dlp` rather than the official API (see `docs/adr/0001-unofficial-download-path-for-transcripts.md`):
+This command needs an optional extra, because it uses `yt-dlp` and `mlx-whisper` rather than the official API (see `docs/adr/0001-unofficial-download-path-for-transcripts.md`):
 
 ```bash
 uv sync --extra transcripts
@@ -120,12 +121,23 @@ Without the extra the command exits with `transcripts_extra_missing` and prints 
 
 - Uploader-written Captions are preferred (`source: captions`); otherwise YouTube's automatic ones are used (`source: auto-captions`). Machine-translated tracks are never used.
 - `--lang <code>` picks the language. Without it, the video's original language is used.
-- The Transcript is stored in the Library Cache, one per video and language. A second call is served from the cache; `--fresh` refetches and `--offline` never fetches. `cache status` reports a `transcripts` count.
+- A video with no Captions in its original language gets a Transcript from Speech Recognition instead (`source: generated`). `--generate` skips Captions and goes straight to Speech Recognition.
+- The Transcript is stored in the Library Cache, one per video and language. A second call is served from the cache; `--fresh` refetches and `--offline` never fetches or generates. `--generate` is served from the cache only when the cached Transcript is already `generated`; otherwise it runs and replaces what is cached, and `--generate --fresh` always reruns. `cache status` reports a `transcripts` count.
 - Output is JSON by default: `data` holds `video_id`, `language`, `source` and `segments`, each Segment with `start`, `end` (seconds) and `text`. `--table` prints one Segment per row with its start time; `--text` prints the text only, one Segment per line. The two cannot be combined.
 - Restricted videos (age-gated, members-only, private) fail with `video_restricted`. Browser cookies are never passed to `yt-dlp`.
 
 | Error code | Exit | Meaning |
 | --- | --- | --- |
-| `no_captions` | 7 | The video has no usable Captions (in the requested language). |
+| `no_captions` | 7 | The video has no Captions in the requested language, and that language is not the one spoken, so Speech Recognition cannot produce it either. |
 | `transcripts_extra_missing` | 8 | The `transcripts` extra is not installed. |
 | `video_restricted` | 9 | The video is age-gated, members-only or private. |
+
+### Speech Recognition
+
+Speech Recognition runs locally with `mlx-whisper`, so it needs an Apple Silicon Mac (elsewhere the extra installs without it and only Captions work) and `ffmpeg` on the `PATH`. Nothing is sent to a cloud service.
+
+- The model defaults to large-v3 (`mlx-community/whisper-large-v3-mlx`). Set `YOUTUBE_WHISPER_MODEL` to another Hugging Face repo or a local model directory to change it, for example `YOUTUBE_WHISPER_MODEL=mlx-community/whisper-large-v3-turbo`.
+- The model is downloaded on first use (about 3 GB for large-v3) into the Hugging Face cache, with a notice on stderr. Later runs reuse it.
+- The video's audio is downloaded with `yt-dlp` to a temporary directory and deleted when the run ends, whether it succeeds or fails.
+- `--lang` is passed to the engine; without it the engine detects the spoken language. Chinese is prompted towards Simplified script with punctuation.
+- Progress goes to stderr; stdout holds only the result.
