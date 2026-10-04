@@ -1,12 +1,14 @@
 import sys
-
+import types
 
 from youtube_cli.transcripts import (
     FakeTrack,
     FakeVideo,
     InMemoryCaptionSource,
+    LiveCaptionSource,
     Segment,
     Source,
+    choose_track,
 )
 
 HELLO = (
@@ -382,3 +384,89 @@ def test_video_transcript_rejects_an_argument_that_is_not_an_id(invoke) -> None:
     assert result.exit_code == 2
     assert result.json()["error"]["code"] == "usage"
     assert captions.list_calls == []
+
+
+class _FakeYoutubeDL:
+    def __init__(self, info: dict[str, object]) -> None:
+        self._info = info
+
+    def __enter__(self) -> "_FakeYoutubeDL":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def extract_info(self, url: str, **kwargs: object) -> dict[str, object]:
+        return self._info
+
+
+def _live_source(monkeypatch, info: dict[str, object]) -> LiveCaptionSource:
+    module = types.SimpleNamespace(YoutubeDL=lambda options: _FakeYoutubeDL(info))
+    monkeypatch.setitem(sys.modules, "yt_dlp", module)
+    return LiveCaptionSource()
+
+
+def _caption_formats(language: str, **query: str) -> list[dict[str, str]]:
+    params = "&".join(f"{key}={value}" for key, value in {"lang": language, **query}.items())
+    return [{"ext": "json3", "url": f"https://www.youtube.com/api/timedtext?{params}"}]
+
+
+def _audio(language: str | None, preference: int) -> dict[str, object]:
+    return {"language": language, "language_preference": preference}
+
+
+def test_original_language_of_a_dubbed_video_is_its_original_audio_track(
+    monkeypatch,
+) -> None:
+    source = _live_source(
+        monkeypatch,
+        {
+            "formats": [
+                *[_audio("es", -1)] * 3,
+                *[_audio("ar", -1)] * 3,
+                *[_audio("en-US", 10)] * 2,
+                _audio(None, -1),
+            ],
+            "subtitles": {
+                "es": _caption_formats("es"),
+                "en": _caption_formats("en"),
+            },
+        },
+    )
+
+    captions = source.list_captions("vidDubbed1")
+
+    assert captions.original_language == "en-US"
+    assert choose_track(captions, language=None).language == "en"
+
+
+def test_original_language_falls_back_to_the_untranslated_automatic_captions(
+    monkeypatch,
+) -> None:
+    source = _live_source(
+        monkeypatch,
+        {
+            "formats": [_audio("es", 5), _audio("de", -1)],
+            "subtitles": {"es": _caption_formats("es")},
+            "automatic_captions": {
+                "es": _caption_formats("de", kind="asr", tlang="es"),
+                "de": _caption_formats("de", kind="asr"),
+            },
+        },
+    )
+
+    assert source.list_captions("vidTalk1").original_language == "de"
+
+
+def test_original_language_is_the_only_audio_language_when_nothing_else_says(
+    monkeypatch,
+) -> None:
+    source = _live_source(
+        monkeypatch,
+        {
+            "formats": [_audio("fr", -1), _audio("fr", -1), _audio(None, -1)],
+            "subtitles": {"en": _caption_formats("en"), "fr": _caption_formats("fr")},
+        },
+    )
+
+    assert source.list_captions("vidTalk1").original_language == "fr"

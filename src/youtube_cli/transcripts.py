@@ -14,6 +14,9 @@ Source = Literal["captions", "auto-captions", "generated"]
 INSTALL_HINT = "uv sync --extra transcripts"
 _SOURCE_PREFERENCE: tuple[Source, ...] = ("captions", "auto-captions")
 _CAPTION_FORMAT = "json3"
+# yt-dlp's language_preference for the original audio track; its "default"
+# track ranks lower and may be a dub picked for the viewer's locale.
+_ORIGINAL_AUDIO = 10
 
 
 @dataclass(frozen=True)
@@ -227,19 +230,7 @@ class LiveCaptionSource:
             *_tracks_from(info.get("subtitles"), source="captions"),
             *_tracks_from(info.get("automatic_captions"), source="auto-captions"),
         )
-        language = info.get("language")
-        original = language if isinstance(language, str) and language else None
-        if original is None:
-            original = _audio_language(info.get("formats"))
-        if original is None:
-            original = next(
-                (
-                    track.language
-                    for track in tracks
-                    if track.source == "auto-captions" and not track.translated
-                ),
-                None,
-            )
+        original = _original_language(info, tracks)
         return VideoCaptions(original_language=original, tracks=tracks)
 
     def fetch_segments(
@@ -282,15 +273,35 @@ def _translate_error(video_id: str, exc: Exception) -> Exception:
     return NetworkError(f"network failure: {message}")
 
 
-def _audio_language(formats: object) -> str | None:
-    languages = [
-        language
-        for language in (
-            entry.get("language") for entry in map(_object_map, _object_list(formats))
-        )
-        if isinstance(language, str) and language
+def _original_language(
+    info: dict[str, object], tracks: tuple[CaptionTrack, ...]
+) -> str | None:
+    language = info.get("language")
+    if isinstance(language, str) and language:
+        return language
+    audio = [
+        (_as_int(entry.get("language_preference")), language)
+        for entry in map(_object_map, _object_list(info.get("formats")))
+        if isinstance(language := entry.get("language"), str) and language
     ]
-    return max(set(languages), key=languages.count) if languages else None
+    marked = next(
+        (language for preference, language in audio if preference >= _ORIGINAL_AUDIO),
+        None,
+    )
+    if marked is not None:
+        return marked
+    spoken = next(
+        (
+            track.language
+            for track in tracks
+            if track.source == "auto-captions" and not track.translated
+        ),
+        None,
+    )
+    if spoken is not None:
+        return spoken
+    languages = {language for _, language in audio}
+    return next(iter(languages)) if len(languages) == 1 else None
 
 
 def _tracks_from(value: object, *, source: Source) -> tuple[CaptionTrack, ...]:
